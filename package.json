@@ -1,0 +1,58 @@
+{
+  "name": "dsh-plotlab",
+  "version": "0.1.0",
+  "description": "PlotLab 绘图工作台（DeepSeek Harness 插件）：拖拽导入数据、一句话需求自动剖析清洗、22 种图表、页面实时调字体字号颜色、统计分析（比较/相关/回归/ROC/生存/PCA）、导出图片与可复现代码。",
+  "license": "MIT",
+  "author": "jszjdyt",
+  "icon": "icon.svg",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "lib/*.mjs",
+    "lib/*.py",
+    "docs/",
+    "examples/",
+    "README.md",
+    "DESIGN.md",
+    "INSTALL.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "plot",
+    "plotting",
+    "visualization",
+    "ggplot",
+    "matplotlib",
+    "statistics",
+    "workbench"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

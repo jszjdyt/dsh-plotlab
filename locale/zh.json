@@ -1,0 +1,10 @@
+{
+  "meta": {
+    "title": "PlotLab 绘图工作台",
+    "description": "拖入数据、说一句需求就自动剖析清洗并出图；22 种图表可在页面实时调字体/字号/颜色；带组间比较、相关、回归、ROC、生存、PCA 等统计分析；导出 300dpi 图片、可复现 Python/R 代码与分析报告。",
+    "detail": "docs/DETAIL.md"
+  },
+  "nav": "绘图",
+  "title": "PlotLab 绘图工作台",
+  "subtitle": "拖入数据 · 说需求 · 调字体配色 · 带走图和代码"
+}

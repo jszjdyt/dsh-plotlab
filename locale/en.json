@@ -1,0 +1,10 @@
+{
+  "meta": {
+    "title": "PlotLab plotting workbench",
+    "description": "Drag in data, describe what you want in one sentence, and get cleaned data with a finished figure; 22 chart types with live font, size and colour controls; built-in statistics (group comparison, correlation, regression, ROC, survival, PCA); export 300 dpi images, reproducible Python/R code and an analysis report.",
+    "detail": "docs/DETAIL.md"
+  },
+  "nav": "PlotLab",
+  "title": "PlotLab plotting workbench",
+  "subtitle": "Drop data · describe · restyle live · keep the figure and the code"
+}
