@@ -382,8 +382,27 @@ def main() -> int:
     assert result["summary"]["key_numbers"]["k"] == 3
 
     # 4 组间比较（配对）
-    result = run_stat(paired_ds, "compare", {"paired": True}, {"x": "group", "y": "value"})
+    # 旧断言「无配对 ID 也能按行序配对」编码的是旧 bug（默认按行序静默错配）：
+    # 现在默认必须 bad_request，并明确给出行序逃生门 pairing="row_order"。
+    try:
+        run_stat(paired_ds, "compare", {"paired": True}, {"x": "group", "y": "value"})
+    except C.EngineError as error:
+        assert error.code == "bad_request", f"配对缺 ID 应 bad_request，实际 {error.code}"
+        assert "row_order" in error.message, f"错误信息必须给出逃生门：{error.message}"
+    else:
+        raise AssertionError("paired=true 且无配对 ID 时必须报错，不能静默按行序配对")
+    # 行序逃生门保留为显式正向用例：成功 + key_numbers/annotation 留痕 + warning
+    result = run_stat(paired_ds, "compare",
+                      {"paired": True, "pairing": "row_order"},
+                      {"x": "group", "y": "value"})
     assert any("配对" in bullet for bullet in result["summary"]["bullets"])
+    assert result["summary"]["key_numbers"].get("pairing_basis") == "row_order", \
+        f"escape hatch 必须记录 pairing_basis：{result['summary']['key_numbers']}"
+    assert (result.get("annotation") or {}).get("pairing_basis") == "row_order", \
+        f"annotation 必须记录 pairing_basis：{result.get('annotation')}"
+    assert any("行序" in str(item) or "row_order" in str(item)
+               for item in result.get("warnings") or []), \
+        f"row_order 必须带 warning：{result.get('warnings')}"
 
     # 5 前提检查
     result = run_stat(clinical, "assumption", {}, {"x": "group", "y": "score"})

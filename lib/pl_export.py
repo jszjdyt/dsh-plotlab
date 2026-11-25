@@ -161,6 +161,7 @@ def _protocol(dataset: Mapping[str, Any], chart_id: str | None, chart_meta: Mapp
                 "group_col": dataset.get("group_col"),
                 "groups": dataset.get("groups"),
                 "need": dataset.get("need"),
+                "data_digest": (last_plot or {}).get("data_digest"),
             },
             "quality": {"score": profile.get("score"), "level": profile.get("level"),
                         "checks": [{"id": c["id"], "level": c["level"], "title": c["title"]} for c in profile.get("checks") or []]},
@@ -168,9 +169,17 @@ def _protocol(dataset: Mapping[str, Any], chart_id: str | None, chart_meta: Mapp
             "figure": {
                 "chart": chart_id,
                 "title": (chart_meta or {}).get("title"),
+                "figure_run_id": (last_plot or {}).get("figure_run_id"),
+                "data_digest": (last_plot or {}).get("data_digest"),
                 "params": params,
                 "roles": roles,
                 "style": style,
+                # 一个 run 固化以下全部内容，保证「协议里的图」和「这次导出的图」同源
+                "tables": C.jsonable((last_plot or {}).get("tables") or []),
+                "layers": C.jsonable((last_plot or {}).get("layers") or []),
+                "confidence_intervals": C.jsonable((last_plot or {}).get("confidence_intervals") or []),
+                "stats": C.jsonable((last_plot or {}).get("stats")),
+                "annotations": C.jsonable((last_plot or {}).get("annotations")),
                 "figures": C.jsonable(_figures_from_last_plot(last_plot)),
             },
             "stats": {

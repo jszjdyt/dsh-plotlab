@@ -379,7 +379,8 @@ def _safe_p(value: Any) -> float:
 def _compare_groups(frame: pd.DataFrame, factor_col: str, value_col: str,
                     style: Mapping[str, Any],
                     levels: Sequence[Any] | None = None,
-                    warnings: list[str] | None = None) -> dict | None:
+                    warnings: list[str] | None = None,
+                    factor: str | None = None) -> dict | None:
     """组间比较：2 组 Welch t / Wilcoxon；>2 组 ANOVA / Kruskal + 两两检验。失败→None + warning。"""
     if warnings is None:
         warnings = []
@@ -472,6 +473,10 @@ def _compare_groups(frame: pd.DataFrame, factor_col: str, value_col: str,
                               "p": _safe_p(p_raw), "n_a": int(a.size), "n_b": int(b.size),
                               "effect_name": effect_name, "effect": float(effect)})
 
+    factor_name = str(factor or "x")
+    for pair in pairs:
+        pair.setdefault("contrast_id", f"{factor_name}:{pair['a']}|{pair['b']}")
+        pair.setdefault("contrast", f"{pair['a']} vs {pair['b']}")
     finite_pairs = [pair for pair in pairs if math.isfinite(pair["p"])]
     adjusted = iter(C.adjust_pvalues([pair["p"] for pair in finite_pairs], p_adjust)) if finite_pairs else iter([])
     adjusted = list(adjusted)
@@ -485,6 +490,7 @@ def _compare_groups(frame: pd.DataFrame, factor_col: str, value_col: str,
         pair["label"] = _sig_label(pair["p_adj"], style)
     return {
         "method": str(global_info["test"]),
+        "factor": factor_name,
         "global": global_info,
         "levels": names,
         "n": {name: int(values.size) for name, values in zip(names, arrays)},
@@ -1153,7 +1159,8 @@ def _stat_for_factor(ctx: Mapping[str, Any], style: Mapping[str, Any],
         warnings.append("x 只有 1 个分类，已跳过组间显著性检验")
         return None
     return _compare_groups(ctx["frame"], "__x", "__y", style,
-                           levels=ctx["levels"], warnings=warnings)
+                           levels=ctx["levels"], warnings=warnings,
+                           factor=str(ctx.get("x_label") or "x"))
 
 
 def _comparison_tables(result: Mapping[str, Any] | None,
@@ -1177,16 +1184,27 @@ def _comparison_tables(result: Mapping[str, Any] | None,
 def _stats_payload(result: Mapping[str, Any] | None) -> dict | None:
     if not result:
         return None
+    factor = result.get("factor")
+    pairs = list(result.get("pairs") or [])
     return {
         "method": result.get("method"),
+        "factor": factor,
         "p_adjust": result.get("p_adjust"),
         "levels": list(result.get("levels") or []),
         "n": dict(result.get("n") or {}),
         "global": dict(result.get("global") or {}),
+        "contrasts": [
+            {"contrast_id": pair.get("contrast_id"),
+             "a": pair.get("a"), "b": pair.get("b"),
+             "test": pair.get("test"),
+             "p": pair.get("p"), "p_adj": pair.get("p_adj"),
+             "effect_name": pair.get("effect_name"), "effect": pair.get("effect")}
+            for pair in pairs
+        ],
         "pairs": [
             {key: pair.get(key) for key in
-             ("a", "b", "test", "p", "p_adj", "effect_name", "effect", "n_a", "n_b")}
-            for pair in result.get("pairs") or []
+             ("a", "b", "contrast_id", "test", "p", "p_adj", "effect_name", "effect", "n_a", "n_b")}
+            for pair in pairs
         ],
     }
 
@@ -1194,12 +1212,22 @@ def _stats_payload(result: Mapping[str, Any] | None) -> dict | None:
 def _annotations_payload(result: Mapping[str, Any] | None) -> dict | None:
     if not result:
         return None
-    pairs = [
-        {"a": pair.get("a"), "b": pair.get("b"), "label": pair.get("label"),
-         "p_adj": pair.get("p_adj")}
-        for pair in result.get("pairs") or []
-    ]
-    return {"method": result.get("method"), "pairs": pairs}
+    factor = result.get("factor")
+    pairs = list(result.get("pairs") or [])
+    return {
+        "method": result.get("method"),
+        "factor": factor,
+        "contrasts": [
+            {"contrast_id": pair.get("contrast_id"), "a": pair.get("a"), "b": pair.get("b"),
+             "label": pair.get("label"), "p_adj": pair.get("p_adj")}
+            for pair in pairs
+        ],
+        "pairs": [
+            {"a": pair.get("a"), "b": pair.get("b"), "contrast_id": pair.get("contrast_id"),
+             "label": pair.get("label"), "p_adj": pair.get("p_adj")}
+            for pair in pairs
+        ],
+    }
 
 
 def _aggregate_columns(ctx: Mapping[str, Any], value_label: str) -> list[dict]:
@@ -3054,15 +3082,60 @@ def _render_heatmap(data: Mapping[str, Any], params: Mapping[str, Any],
 # ---------------------------------------------------------------------------
 
 
-def _corr_pvalue(r: float, n: float) -> float:
-    if not math.isfinite(r) or not math.isfinite(n) or n < 3:
-        return float("nan")
-    if abs(r) >= 1.0:
-        return 0.0
+def _exact_rank_pvalue(a: np.ndarray, b: np.ndarray) -> float | None:
+    """小样本 Spearman 精确置换 p（双侧 |rho|）；n>6 返回 None。
+
+    scipy 的 spearmanr 用 t 渐近近似，rho=±1 且 n 很小时会给出 p=0（零分布被压扁）；
+    斐查小样本（n<=6）用全部 n! 次秩置换枚举真实零分布。
+    """
+    n = int(a.size)
+    if n < 3 or n > 6:
+        return None
+    from itertools import permutations
+
     try:
-        statistic = abs(r) * math.sqrt((n - 2.0) / max(1e-300, 1.0 - r * r))
-        return float(2.0 * sps.t.sf(statistic, n - 2.0))
-    except Exception:  # noqa: BLE001
+        from scipy.stats import rankdata
+
+        ranks_a = rankdata(a)
+        ranks_b = rankdata(b)
+
+        def rho(left: np.ndarray, right: np.ndarray) -> float:
+            x = left - left.mean()
+            y = right - right.mean()
+            denom = math.sqrt(float((x ** 2).sum()) * float((y ** 2).sum()))
+            return float((x * y).sum() / denom) if denom > 1e-12 else 0.0
+
+        observed = abs(rho(ranks_a, ranks_b))
+        hits = 0
+        total = 0
+        for order in permutations(range(n)):
+            total += 1
+            if abs(rho(ranks_a, ranks_b[list(order)])) >= observed - 1e-12:
+                hits += 1
+        return hits / total if total else None
+    except Exception:  # noqa: BLE001 - 退化数据退回渐近近似
+        return None
+
+
+def _corr_pvalue(x: np.ndarray, y: np.ndarray, method: str) -> float:
+    """按方法分派真实零分布：Pearson=t 近似；Spearman=小样本精确置换/AS89；Kendall=tau。"""
+    left = np.asarray(x, dtype=float)
+    right = np.asarray(y, dtype=float)
+    mask = np.isfinite(left) & np.isfinite(right)
+    a, b = left[mask], right[mask]
+    if a.size < 3:
+        return float("nan")
+    try:
+        name = str(method or "pearson").lower()
+        if name == "kendall":
+            return float(sps.kendalltau(a, b).pvalue)
+        if name == "spearman":
+            exact = _exact_rank_pvalue(a, b)
+            if exact is not None:
+                return float(exact)
+            return float(sps.spearmanr(a, b).pvalue)
+        return float(sps.pearsonr(a, b).pvalue)
+    except Exception:  # noqa: BLE001 - 常数序列等退化情形
         return float("nan")
 
 
@@ -3081,16 +3154,15 @@ def _render_corr(data: Mapping[str, Any], params: Mapping[str, Any],
         corr = frame.corr(method=method).to_numpy(dtype=float)
     except Exception as exc:  # noqa: BLE001
         raise C.EngineError("internal", f"相关矩阵计算失败：{exc}") from exc
-    mask = np.isfinite(arr)
-    counts = mask.T.astype(float) @ mask.astype(float)
     k = len(features)
     pmatrix = np.ones((k, k), dtype=float)
+    columns = [frame[features[index]].to_numpy(dtype=float) for index in range(k)]
     for i in range(k):
         for j in range(k):
             if i == j:
                 pmatrix[i, j] = 0.0
             else:
-                pmatrix[i, j] = _corr_pvalue(float(corr[i, j]), float(counts[i, j]))
+                pmatrix[i, j] = _corr_pvalue(columns[i], columns[j], method)
     finite = corr[np.isfinite(corr)]
     if finite.size == 0:
         raise C.prerequisite("相关矩阵没有有效数值（变量可能全为缺失或常数）")
@@ -4541,6 +4613,11 @@ _RENDERERS = {
 }
 
 
+def _declared_independent(params: Mapping[str, Any]) -> bool:
+    value = str(params.get("independent_samples") or "").strip().lower()
+    return value in ("sample", "independent", "1", "true", "yes")
+
+
 def render(chart_id: str, data: Mapping[str, Any], params: Mapping[str, Any],
            style: Mapping[str, Any], outdir: str) -> dict:
     """渲染单个图表并返回 DESIGN §5 的结果 dict。"""
@@ -4556,6 +4633,15 @@ def render(chart_id: str, data: Mapping[str, Any], params: Mapping[str, Any],
     data = data if isinstance(data, Mapping) else {}
     outdir = str(outdir or ".")
     data_warnings = [str(note) for note in (data.get("notes") or [])]
+    if data.get("melted") and not _declared_independent(params_dict):
+        # 矩阵融化视图：同一生物样本内的多个特征值是技术重复，汇总图默认只做描述性
+        data_warnings.append(
+            "矩阵数据已融化为长表：本次汇总图只做描述性展示（描述性/技术重复），"
+            "同一生物样本内的多个特征值属于技术重复，不能当作独立生物学重复做显著性检验；"
+            "如需正式检验，请显式声明独立样本（params.independent_samples=\"sample\"）"
+        )
+        resolved_style = dict(resolved_style)
+        resolved_style["stat_annot"] = False
     try:
         with C.style_context(resolved_style):
             out = renderer(data, params_dict, resolved_style)

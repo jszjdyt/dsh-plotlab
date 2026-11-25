@@ -19,6 +19,65 @@ import pl_state as S
 
 MAX_CORR_COLUMNS = 12
 
+# 端点 / 结局 / 生存类列名：自动清洗不得删除、转数值、填补或变换（否则会洗白结局）
+_ENDPOINT_RE = re.compile(
+    r"(response|outcome|event|status|death|dead|vital|censor|survival|follow|recur|relapse"
+    r"|\b(?:os|dfs|rfs|pfs)\b|结局|事件|随访|生存|复发)",
+    re.IGNORECASE,
+)
+
+
+def protected_columns(dataset: Mapping[str, Any]) -> set[str]:
+    """自动清洗需要保护的列：ID、分组、端点/结局、生存时间与事件。
+
+    这些列可以参与展示，但自动清洗不能删除、改类型、填补或做离群值处理，
+    否则会破坏数据身份或伪造结局。
+    """
+    df = dataset.get("df")
+    if df is None:
+        return set()
+    columns = {str(c) for c in df.columns}
+    protected: set[str] = set()
+
+    def keep(value: Any) -> None:
+        if value is not None and str(value) in columns:
+            protected.add(str(value))
+
+    keep(dataset.get("id_col"))
+    keep(dataset.get("group_col"))
+    roles = dataset.get("roles") or {}
+    for role in ("id", "group", "color", "facet", "time", "event"):
+        keep(roles.get(role))
+    for column in columns:
+        if _ENDPOINT_RE.search(column):
+            protected.add(column)
+        if P._matches(column, P.GROUP_NAME_HINTS):
+            protected.add(column)
+    return protected
+
+
+def endpoint_columns(dataset: Mapping[str, Any]) -> set[str]:
+    """端点/结局/生存类列：可以删行（缺失无法分析），但绝不填补/改类型/缩尾。"""
+    df = dataset.get("df")
+    if df is None:
+        return set()
+    columns = {str(c) for c in df.columns}
+    endpoints: set[str] = set()
+
+    def keep(value: Any) -> None:
+        if value is not None and str(value) in columns:
+            endpoints.add(str(value))
+
+    roles = dataset.get("roles") or {}
+    for role in ("time", "event"):
+        keep(roles.get(role))
+    for column in columns:
+        if _ENDPOINT_RE.search(column):
+            endpoints.add(column)
+    return endpoints
+
+
+
 
 # ---------------------------------------------------------------------------
 # 剖析
@@ -413,22 +472,33 @@ def auto_plan(dataset: Mapping[str, Any]) -> list[dict]:
         raise C.prerequisite("没有数据，无法生成清洗计划")
     columns = dataset.get("columns") or P.column_summaries(df)
     plan: list[dict] = []
+    protected = protected_columns(dataset)
 
-    empty = [c["key"] for c in columns if int(c.get("missing") or 0) >= len(df)]
+    empty = [c["key"] for c in columns
+             if int(c.get("missing") or 0) >= len(df) and str(c["key"]) not in protected]
     if empty:
         plan.append({"op": "drop_empty", "params": {"columns": empty}, "reason": f"删除 {len(empty)} 个全空列"})
+    kept_empty = [str(c["key"]) for c in columns
+                  if int(c.get("missing") or 0) >= len(df) and str(c["key"]) in protected]
+    if kept_empty:
+        plan.append({"op": "none", "params": {},
+                     "reason": f"全空列 {'、'.join(kept_empty[:5])} 属于 ID/分组/端点，受保护不删除；"
+                               "请人工确认该列是否可移除"})
 
     dup = int(df.duplicated().sum()) if len(df) else 0
     if dup:
         plan.append({"op": "drop_duplicates", "params": {}, "reason": f"删除 {dup} 行完全重复记录"})
 
-    const = [c["key"] for c in columns if int(c.get("n_unique") or 0) <= 1 and int(c.get("missing") or 0) < len(df)]
+    const = [c["key"] for c in columns
+             if int(c.get("n_unique") or 0) <= 1 and int(c.get("missing") or 0) < len(df)
+             and str(c["key"]) not in protected]
     if const:
         plan.append({"op": "drop_columns", "params": {"columns": const},
                      "reason": f"{len(const)} 个常量列对分析无贡献，删除"})
 
     numeric_text = []
-    for column in [c["key"] for c in columns if c.get("dtype") in ("text", "category")][:20]:
+    for column in [c["key"] for c in columns
+                   if c.get("dtype") in ("text", "category") and str(c["key"]) not in protected][:20]:
         series = df[column].dropna().astype(str).head(300)
         if not len(series):
             continue
@@ -439,23 +509,59 @@ def auto_plan(dataset: Mapping[str, Any]) -> list[dict]:
         plan.append({"op": "coerce", "params": {"columns": {c: "numeric" for c in numeric_text}},
                      "reason": f"{len(numeric_text)} 列是数字文本，转成数值以便绘图"})
 
-    missing_cols = [
+    # 缺失按列独立处理：数值列少缺失→中位数填补；分类列缺失→删除相应行；
+    # 缺失过多→删除相应行。端点/ID/分组列受保护，既不填补也不删除列。
+    numeric_missing = [
         c["key"] for c in columns
-        if c.get("dtype") == "numeric" and 0 < int(c.get("missing") or 0) < len(df) * 0.2
+        if c.get("dtype") == "numeric" and str(c["key"]) not in protected
+        and 0 < int(c.get("missing") or 0) < len(df) * 0.2
     ]
-    if missing_cols:
-        plan.append({"op": "impute", "params": {"columns": missing_cols, "method": "median"},
-                     "reason": f"{len(missing_cols)} 个数值列缺失 <20%，用中位数填补（保留样本量）"})
+    if numeric_missing:
+        plan.append({"op": "impute", "params": {"columns": numeric_missing, "method": "median"},
+                     "reason": f"{len(numeric_missing)} 个数值列缺失 <20%，按列独立用中位数填补（保留样本量）"})
+    categorical_missing = [
+        c["key"] for c in columns
+        if c.get("dtype") in ("category", "text") and str(c["key"]) not in protected
+        and 0 < int(c.get("missing") or 0) < len(df)
+    ]
+    if categorical_missing:
+        plan.append({"op": "dropna", "params": {"columns": categorical_missing, "how": "any"},
+                     "reason": f"{len(categorical_missing)} 个分类列有缺失，按列独立删除这些列缺失的行"})
     drop_rows_cols = [
         c["key"] for c in columns
-        if 0 < int(c.get("missing") or 0) >= len(df) * 0.2
+        if str(c["key"]) not in protected and 0 < int(c.get("missing") or 0) >= len(df) * 0.2
     ]
     if drop_rows_cols:
         plan.append({"op": "dropna", "params": {"columns": drop_rows_cols, "how": "any"},
                      "reason": f"{len(drop_rows_cols)} 个列缺失 ≥20%，删除这些列缺失的行"})
+    endpoints = endpoint_columns(dataset)
+    protected_missing = [
+        c["key"] for c in columns
+        if str(c["key"]) in protected and 0 < int(c.get("missing") or 0) < len(df)
+        and str(c["key"]) not in endpoints
+    ]
+    if protected_missing:
+        plan.append({"op": "dropna", "params": {"columns": protected_missing, "how": "any"},
+                     "reason": f"受保护列 {'、'.join(str(c) for c in protected_missing[:5])} 缺失："
+                               "不填补也不改类型，按列独立删除缺失行"})
+    endpoint_missing = [
+        c["key"] for c in columns
+        if str(c["key"]) in endpoints and 0 < int(c.get("missing") or 0) < len(df)
+    ]
+    if endpoint_missing:
+        plan.append({"op": "dropna", "params": {"columns": endpoint_missing, "how": "any"},
+                     "reason": f"端点列 {'、'.join(str(c) for c in endpoint_missing[:5])} 有缺失："
+                               "不填补（避免伪造结局），按列独立删除缺失行"})
+    filled_protected = [
+        c["key"] for c in columns
+        if str(c["key"]) in protected and int(c.get("missing") or 0) >= len(df)
+    ]
+    if filled_protected:
+        plan.append({"op": "none", "params": {},
+                     "reason": f"受保护列 {'、'.join(str(c) for c in filled_protected[:5])} 全空，"
+                               "自动清洗既不填补也不删除，请人工确认"})
 
-    # 负值 log 提示（不自动做，避免改变量纲；放进 plan 但默认跳过？）
-    numeric = [c for c in columns if c.get("dtype") == "numeric"]
+    numeric = [c for c in columns if c.get("dtype") == "numeric" and str(c["key"]) not in protected]
     heavy_outlier = []
     for item in numeric[:20]:
         values = P.to_numeric(df[item["key"]]).replace([np.inf, -np.inf], np.nan)
@@ -530,8 +636,12 @@ def _summarize_counts(df: pd.DataFrame, rows_before: int) -> dict:
 
 
 def apply_clean(dataset: dict, plan: Sequence[Mapping[str, Any]] | None = None,
-                auto: bool = False) -> dict:
-    """执行清洗计划并写回 dataset。返回 {applied, skipped, warnings, preview}。"""
+                auto: bool = False, dry_run: bool = False) -> dict:
+    """执行清洗计划并写回 dataset。返回 {applied, skipped, warnings, preview}。
+
+    dry_run=True（页面/接口的 preview 模式）：在副本上试算，返回同样的计划与实际行数变化，
+    但不写回 dataset["df"]、不追加 cleaning 记录，用于先预览再决定是否落盘。
+    """
     if dataset.get("df") is None:
         raise C.prerequisite("没有数据，无法清洗")
     steps = list(plan or [])
@@ -743,15 +853,30 @@ def apply_clean(dataset: dict, plan: Sequence[Mapping[str, Any]] | None = None,
         record = {"op": op, "params": C.jsonable(params), "reason": reason or None,
                   **_summarize_counts(df, before), "notes": note}
         applied.append(record)
-        dataset.setdefault("cleaning", []).append(record)
 
+    if dry_run:
+        preview_dataset = dict(dataset)
+        preview_dataset["df"] = df.reset_index(drop=True)
+        S.refresh_columns(preview_dataset)
+        return {
+            "dry_run": True,
+            "applied": applied,
+            "skipped": skipped,
+            "warnings": warnings,
+            "n_rows": int(len(df)),
+            "n_cols": int(df.shape[1]),
+            "n_rows_before": int(len(dataset.get("df"))),
+            "preview": P.sample_rows(preview_dataset, 20),
+            "columns": C.jsonable(preview_dataset.get("columns") or []),
+            "plan": C.jsonable(steps),
+        }
     dataset["df"] = df.reset_index(drop=True)
+    dataset.setdefault("cleaning", []).extend(applied)
     dataset.setdefault("steps", []).append("clean")
     S.refresh_columns(dataset)
-    if dataset.get("raw_df") is not None and len(dataset["raw_df"]) != len(dataset["df"]):
-        pass
     preview = P.sample_rows(dataset, 20)
     return {
+        "dry_run": False,
         "applied": applied,
         "skipped": skipped,
         "warnings": warnings,

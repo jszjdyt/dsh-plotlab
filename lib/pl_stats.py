@@ -63,7 +63,12 @@ STATS_CATALOG: list[dict] = [
         "params": [
             {"key": "method", "label": "检验方法", "type": "select", "default": "auto",
              "options": ["auto", "welch", "student", "wilcox", "anova", "kruskal"]},
-            {"key": "paired", "label": "配对设计（按组内出现顺序配对）", "type": "boolean", "default": False},
+            {"key": "paired", "label": "配对设计（默认按配对 ID；无 ID 会报错）", "type": "boolean", "default": False},
+            {"key": "paired_id", "label": "配对 ID 列（配对设计用）", "type": "text", "default": ""},
+            {"key": "pairing", "label": "配对依据", "type": "select", "default": "auto",
+             "options": ["auto", "id", "row_order"]},
+            {"key": "independent_samples", "label": "矩阵数据的独立样本单位（默认拒绝检验）",
+             "type": "text", "default": ""},
             {"key": "adjust", "label": "多重校正", "type": "select", "default": "bh",
              "options": ["bh", "bonferroni", "holm", "none"]},
             {"key": "bootstrap", "label": "bootstrap 次数", "type": "number", "default": 2000,
@@ -1014,12 +1019,13 @@ _TEST_LABELS = {
 }
 
 _METHOD_TEXT = {
-    "welch": "Welch 两样本 t 检验（scipy.stats.ttest_ind, equal_var=False）；效应量 Cohen's d / Hedges' g；"
+    "welch": "Welch 两样本 t 检验（scipy.stats.ttest_ind, equal_var=False）；主结果/CI/Cohen's d 均取自 Welch；"
              "均值差 95%CI 用 Welch–Satterthwaite 自由度 t 近似，并用 percentile bootstrap 复核",
-    "student": "Student 两样本 t 检验（scipy.stats.ttest_ind, equal_var=True）；效应量 Cohen's d",
+    "student": "Student 两样本 t 检验（scipy.stats.ttest_ind, equal_var=True）；主结果/CI/Cohen's d 均取自等方差版本；"
+               "均值差 95%CI 用 n₁+n₂−2 自由度 t 近似，并用 percentile bootstrap 复核",
     "wilcox": "Mann-Whitney U 秩和检验（scipy.stats.mannwhitneyu, two-sided）；"
               "效应量秩二列相关 r = 2U/(n₁·n₂) − 1",
-    "paired_t": "配对 t 检验（scipy.stats.ttest_rel）；效应量 Cohen's dz；配对按各组在数据中的出现顺序构建",
+    "paired_t": "配对 t 检验（scipy.stats.ttest_rel）；效应量 Cohen's dz；配对依据在结果与 annotation 中显式记录",
     "anova": "单因素方差分析（scipy.stats.f_oneway；SS 表由组均值/平方和计算）；效应量 η²/ω²；"
              "事后两两比较用 Welch t 检验 + 多重校正（近似 Games-Howell）",
     "kruskal": "Kruskal-Wallis 秩和检验（scipy.stats.kruskal）；效应量 ε² = (H − k + 1)/(n − k)；"
@@ -1071,7 +1077,16 @@ def _run_describe(ctx: _Ctx) -> dict:
             info["missing"] = 0
             rows.append({"variable": value_label, "group": _label(raw), **info})
         columns = [value_label]
-        bullets.append(f"矩阵数据按样本汇总：{len(rows)} 个样本 × 每个样本的数值分布")
+        n_features = int(tidy["__id"].nunique()) if "__id" in tidy.columns else (
+            int(rows[0]["n"]) if rows else 0)
+        bullets.append(
+            f"矩阵数据按样本汇总：{len(rows)} 个样本 × 每个样本的数值分布；"
+            f"每行 n={n_features} 来自特征数（同一生物样本内的技术重复），不代表生物学重复数"
+        )
+        ctx.warnings.append(
+            "矩阵融化视图：描述统计的 n 是特征数（技术重复），不能当作生物学重复；"
+            "组间检验请先显式声明独立样本（compare 的 independent_samples）"
+        )
     else:
         if not columns:
             y_col = roles.get("y")
@@ -1159,13 +1174,19 @@ def _run_describe(ctx: _Ctx) -> dict:
 
 def _two_group_payload(ctx: _Ctx, groups: list[tuple[str, np.ndarray]],
                        method_req: str, paired: bool, adjust: str, reps: int,
-                       y_label: str) -> dict:
+                       y_label: str, x_label: str = "x",
+                       pairing_basis: str = "independent",
+                       n_pairs: int | None = None) -> dict:
     (la, a), (lb, b) = groups[0], groups[1]
     na, nb = int(a.size), int(b.size)
     warnings = ctx.warnings
     bullets: list[str] = []
     test_rows: list[dict] = []
     estimate_rows: list[dict] = []
+    factor = str(x_label or "x")
+    contrast_text = f"{la} vs {lb}"
+    contrast_id = f"{factor}:{la}|{lb}"
+    pair_count = int(n_pairs) if (paired and n_pairs is not None) else (na if paired else None)
 
     stats_a = _summary_stats(a)
     stats_b = _summary_stats(b)
@@ -1180,7 +1201,13 @@ def _two_group_payload(ctx: _Ctx, groups: list[tuple[str, np.ndarray]],
             )
         if na < 3:
             raise C.prerequisite("配对样本少于 3 对，无法做配对检验")
-        warnings.append("paired=true：按各组在数据中的出现顺序配对，请确认行顺序即配对顺序")
+        if pairing_basis == "id":
+            bullets.append(f"配对方式：按配对 ID 对齐（{pair_count} 对完整观测，ID 集合两侧一致）")
+        else:
+            warnings.append(
+                "paired=true 且 pairing=row_order：按各组在数据中的出现顺序（行序）配对，"
+                "请确认行序即配对顺序（如需按 ID 配对请传 paired_id 或 pairing=id）"
+            )
         paired_res = _paired_test(a, b)
         wil = _wilcoxon_paired(a, b)
         diff_norm = paired_res["norm_p"]
@@ -1227,7 +1254,14 @@ def _two_group_payload(ctx: _Ctx, groups: list[tuple[str, np.ndarray]],
         ])
         if wil is not None:
             bullets.append(f"Wilcoxon 符号秩检验：W={C.fmt_num(wil['statistic'])}，{_p_phrase(wil['p'])}")
-        method = _METHOD_TEXT["paired_t"]
+        if pairing_basis == "id":
+            pairing_text = f"配对按登记 ID 对齐（{pair_count} 对完整观测，两侧 ID 集合一致）"
+        else:
+            pairing_text = f"配对按各组在数据中的出现顺序（row_order 逃生门，{pair_count} 对，可能错配）"
+        method = (
+            "配对 t 检验（scipy.stats.ttest_rel）；效应量 Cohen's dz；"
+            f"n_pairs={pair_count}；{pairing_text}；配对差 95%CI 用 t 近似"
+        )
         primary_name = _TEST_LABELS["paired_t"] if primary == "paired_t" else _TEST_LABELS["wilcox"]
     else:
         welch = _welch_test(a, b)
@@ -1250,93 +1284,143 @@ def _two_group_payload(ctx: _Ctx, groups: list[tuple[str, np.ndarray]],
                 + ("已优先采用非参数检验" if primary == "wilcox" else "仍报告参数检验结果，可参考非参数兜底")
             )
 
-        welch_row = {
-            "test": _TEST_LABELS["welch"] + ("（主检验）" if primary == "welch" else "（参考）"),
-            "statistic": welch["t"], "df": welch["df"], "p": welch["p"],
-            "effect_name": "Cohen's d", "effect_value": welch["d"],
-            "note": f"Hedges' g={C.fmt_num(_hedges_g(welch['d'], a, b))}",
+        rows_by_key = {
+            "welch": {
+                "statistic": welch["t"], "df": welch["df"], "p": welch["p"],
+                "effect_name": "Cohen's d", "effect_value": welch["d"],
+                "note": "Welch–Satterthwaite 自由度；Cohen's d 用合并标准差",
+            },
+            "student": {
+                "statistic": student["t"], "df": student["df"], "p": student["p"],
+                "effect_name": "Cohen's d", "effect_value": student["d"],
+                "note": "等方差假设版本；df=n₁+n₂−2",
+            },
+            "wilcox": {
+                "statistic": mw["u"], "df": None, "p": mw["p"],
+                "effect_name": "rank-biserial r", "effect_value": mw["r"],
+                "note": "秩和检验，不依赖正态性",
+            },
         }
-        student_row = {
-            "test": _TEST_LABELS["student"] + ("（主检验）" if primary == "student" else "（参考）"),
-            "statistic": student["t"], "df": student["df"], "p": student["p"],
-            "effect_name": "Cohen's d", "effect_value": student["d"],
-            "note": "等方差假设版本",
-        }
-        mw_row = {
-            "test": _TEST_LABELS["wilcox"] + ("（主检验）" if primary == "wilcox" else "（非参数兜底）"),
-            "statistic": mw["u"], "df": None, "p": mw["p"],
-            "effect_name": "rank-biserial r", "effect_value": mw["r"],
-            "note": "秩和检验，不依赖正态性",
-        }
-        ordered = {"welch": [welch_row, mw_row, student_row],
-                   "student": [student_row, mw_row],
-                   "wilcox": [mw_row, welch_row]}[primary]
-        test_rows.extend(ordered)
+        for key, row in rows_by_key.items():
+            if key == primary:
+                suffix = "（主检验）"
+            elif key == "wilcox":
+                suffix = "（非参数兜底）"
+            else:
+                suffix = "（参考）"
+            row["test"] = _TEST_LABELS[key] + suffix
+        order = {
+            "welch": ["welch", "wilcox", "student"],
+            "student": ["student", "welch", "wilcox"],
+            "wilcox": ["wilcox", "welch", "student"],
+        }[primary]
+        test_rows.extend([rows_by_key[key] for key in order])
 
         boot = _try(ctx, "均值差 bootstrap 95%CI",
                     lambda: _bootstrap_diff_ci(a, b, reps), None)
-        effect_name = "Cohen's d" if primary != "wilcox" else "rank-biserial r"
-        effect_value = welch["d"] if primary != "wilcox" else mw["r"]
-        estimate_rows.extend([
-            {"metric": "均值差（a − b）", "value": welch["diff"], "note": f"{la} − {lb}"},
-            {"metric": "95%CI 下限（t 近似）", "value": welch["ci"][0], "note": ""},
-            {"metric": "95%CI 上限（t 近似）", "value": welch["ci"][1], "note": ""},
-            {"metric": "bootstrap 95%CI 下限", "value": boot[0] if boot else None,
-             "note": f"{reps} 次重抽样，seed=0"},
-            {"metric": "bootstrap 95%CI 上限", "value": boot[1] if boot else None,
-             "note": f"{reps} 次重抽样，seed=0"},
-            {"metric": "Cohen's d", "value": welch["d"], "note": _effect_label_d(welch["d"])},
-            {"metric": "Hedges' g", "value": _hedges_g(welch["d"], a, b), "note": "小样本偏倚校正"},
-            {"metric": "rank-biserial r", "value": mw["r"], "note": _effect_label_r(mw["r"])},
-        ])
-        higher, lower = ((la, stats_a), (lb, stats_b)) if stats_a["mean"] >= stats_b["mean"] else (
+        primary_res = {"welch": welch, "student": student}.get(primary)
+        diff = primary_res["diff"] if primary_res is not None else student["diff"]
+        estimate_rows.append({"metric": "均值差（a − b）", "value": diff, "note": f"{la} − {lb}"})
+        ci_low = ci_high = None
+        if primary_res is not None:
+            ci_low, ci_high = primary_res["ci"]
+            if primary == "student":
+                ci_kind = "Student t 近似"
+                ci_note = f"df={C.fmt_num(student['df'])}（等方差）"
+            else:
+                ci_kind = "Welch–Satterthwaite t 近似"
+                ci_note = f"df={C.fmt_num(welch['df'])}（Welch）"
+            estimate_rows.extend([
+                {"metric": f"95%CI 下限（{ci_kind}）", "value": ci_low, "note": ci_note},
+                {"metric": f"95%CI 上限（{ci_kind}）", "value": ci_high, "note": ci_note},
+            ])
+        if boot is not None:
+            estimate_rows.extend([
+                {"metric": "bootstrap 95%CI 下限", "value": boot[0],
+                 "note": f"{reps} 次重抽样，seed=0"},
+                {"metric": "bootstrap 95%CI 上限", "value": boot[1],
+                 "note": f"{reps} 次重抽样，seed=0"},
+            ])
+        if primary == "wilcox":
+            primary_effect = mw["r"]
+            estimate_rows.extend([
+                {"metric": "rank-biserial r", "value": mw["r"], "note": _effect_label_r(mw["r"])},
+                {"metric": "Cohen's d（参考）", "value": welch["d"], "note": "Welch 版本，仅作对比"},
+            ])
+        else:
+            primary_effect = primary_res["d"]
+            estimate_rows.extend([
+                {"metric": "Cohen's d", "value": primary_res["d"],
+                 "note": _effect_label_d(primary_res["d"])},
+                {"metric": "Hedges' g", "value": _hedges_g(primary_res["d"], a, b),
+                 "note": "小样本偏倚校正"},
+                {"metric": "rank-biserial r", "value": mw["r"], "note": _effect_label_r(mw["r"])},
+            ])
+        stats_high, stats_low = ((la, stats_a), (lb, stats_b)) if stats_a["mean"] >= stats_b["mean"] else (
             (lb, stats_b), (la, stats_a))
         diff_abs = abs(stats_a["mean"] - stats_b["mean"])
-        ci_low, ci_high = welch["ci"]
-        if ci_low is not None and ci_high is not None and ci_low > ci_high:
-            ci_low, ci_high = ci_high, ci_low
-        if higher[0] == la:
-            interval_low, interval_high = ci_low, ci_high
-        else:
-            interval_low, interval_high = -ci_high, -ci_low
+        interval_text = "95%CI 无法估计"
+        if ci_low is not None and ci_high is not None:
+            if ci_low > ci_high:
+                ci_low, ci_high = ci_high, ci_low
+            if stats_high[0] == la:
+                interval_low, interval_high = ci_low, ci_high
+            else:
+                interval_low, interval_high = -ci_high, -ci_low
+            interval_text = f"95%CI {C.fmt_num(interval_low)}–{C.fmt_num(interval_high)}"
+        elif boot is not None:
+            interval_text = f"bootstrap 95%CI {C.fmt_num(boot[0])}–{C.fmt_num(boot[1])}"
         direction = "高" if diff_abs > 0 else "持平"
         bullets.append(
-            f"均值差 {C.fmt_num(diff_abs)}（{higher[0]} 较 {lower[0]} {direction}；"
-            f"95%CI {C.fmt_num(interval_low)}–{C.fmt_num(interval_high)}）"
+            f"均值差 {C.fmt_num(diff_abs)}（{stats_high[0]} 较 {stats_low[0]} {direction}；{interval_text}）"
         )
-        if primary == "wilcox":
+        if primary in ("welch", "student"):
+            name = "Student t" if primary == "student" else "Welch t"
             bullets.append(
-                f"Mann-Whitney U={C.fmt_num(mw['u'])}，{_p_phrase(mw['p'])}，"
-                f"rank-biserial r={C.fmt_num(mw['r'])}（{_effect_label_r(mw['r'])}）"
+                f"{name}={C.fmt_num(primary_res['t'])}，df={C.fmt_num(primary_res['df'])}，"
+                f"{_p_phrase(primary_res['p'])}，"
+                f"Cohen's d={C.fmt_num(primary_res['d'])}（{_effect_label_d(primary_res['d'])}）"
             )
-        else:
-            bullets.append(
-                f"Welch t={C.fmt_num(welch['t'])}，df={C.fmt_num(welch['df'])}，{_p_phrase(welch['p'])}，"
-                f"Cohen's d={C.fmt_num(welch['d'])}（{_effect_label_d(welch['d'])}）"
-            )
-            bullets.append(
-                f"Mann-Whitney U={C.fmt_num(mw['u'])}，{_p_phrase(mw['p'])}，"
-                f"rank-biserial r={C.fmt_num(mw['r'])}（{_effect_label_r(mw['r'])}）"
-            )
+        bullets.append(
+            f"Mann-Whitney U={C.fmt_num(mw['u'])}，{_p_phrase(mw['p'])}，"
+            f"rank-biserial r={C.fmt_num(mw['r'])}（{_effect_label_r(mw['r'])}）"
+        )
         if boot is not None:
             bullets.append(
                 f"bootstrap {reps} 次：均值差 95%CI {C.fmt_num(boot[0])}–{C.fmt_num(boot[1])}"
             )
-        primary_p = welch["p"] if primary != "wilcox" else mw["p"]
-        primary_effect = effect_value
+        primary_p = {"welch": welch["p"], "student": student["p"], "wilcox": mw["p"]}[primary]
         primary_name = _TEST_LABELS[primary]
         method = _METHOD_TEXT[primary]
 
     adjusted = float(C.adjust_pvalues([primary_p], adjust)[0])
     annotation = {
         "groups": [la, lb],
+        "factor": factor,
+        "x_label": x_label,
+        "contrasts": [{
+            "contrast_id": contrast_id,
+            "contrast": contrast_text,
+            "a": la, "b": lb,
+            "p_adj": adjusted,
+            "test": primary_name,
+        }],
         "pairs": [{
-            "a": la, "b": lb, "p_adj": adjusted,
+            "a": la, "b": lb,
+            "contrast_id": contrast_id,
+            "contrast": contrast_text,
+            "p_raw": float(primary_p),
+            "p_adj": adjusted,
             "stars": C.p_stars(adjusted),
             "label": _annot_label(adjusted, ctx.style),
+            "test": primary_name,
+            "n_a": na,
+            "n_b": nb,
         }],
         "test": primary_name,
         "n": {la: na, lb: nb},
+        "n_pairs": pair_count,
+        "pairing_basis": pairing_basis,
         "y_label": y_label,
     }
     tables = [
@@ -1364,6 +1448,11 @@ def _two_group_payload(ctx: _Ctx, groups: list[tuple[str, np.ndarray]],
         "p_adj": adjusted,
         "effect": primary_effect,
         "test": primary_name,
+        "method": primary if not paired else ("paired_t" if primary == "paired_t" else "wilcox"),
+        "pairing_basis": pairing_basis,
+        "n_pairs": pair_count,
+        "factor": factor,
+        "contrast_id": contrast_id,
     }
     return {
         "bullets": bullets,
@@ -1377,8 +1466,10 @@ def _two_group_payload(ctx: _Ctx, groups: list[tuple[str, np.ndarray]],
 
 
 def _multi_group_payload(ctx: _Ctx, groups: list[tuple[str, np.ndarray]],
-                         method_req: str, adjust: str, y_label: str) -> dict:
+                         method_req: str, adjust: str, y_label: str,
+                         x_label: str = "x") -> dict:
     warnings = ctx.warnings
+    factor = str(x_label or "x")
     labels_list = [label for label, _ in groups]
     arrays = [values for _, values in groups]
     k = len(arrays)
@@ -1411,6 +1502,7 @@ def _multi_group_payload(ctx: _Ctx, groups: list[tuple[str, np.ndarray]],
     ]
     pair_rows: list[dict] = []
     pair_raw: list[dict] = []
+    contrast_ids: list[str] = []
     for i in range(k):
         for j in range(i + 1, k):
             if primary == "anova":
@@ -1425,8 +1517,12 @@ def _multi_group_payload(ctx: _Ctx, groups: list[tuple[str, np.ndarray]],
                 p_value = res["p"]
                 effect = res["r"]
                 effect_name = "rank-biserial r"
+            contrast_id = f"{factor}:{labels_list[i]}|{labels_list[j]}"
+            contrast_ids.append(contrast_id)
             pair_raw.append({
                 "a": labels_list[i], "b": labels_list[j],
+                "contrast_id": contrast_id,
+                "contrast": f"{labels_list[i]} vs {labels_list[j]}",
                 "statistic": statistic, "p": p_value, "effect": effect,
                 "effect_name": effect_name,
             })
@@ -1434,6 +1530,7 @@ def _multi_group_payload(ctx: _Ctx, groups: list[tuple[str, np.ndarray]],
     for item, p_adj in zip(pair_raw, adjusted):
         pair_rows.append({
             "pair": f"{item['a']} vs {item['b']}",
+            "contrast_id": item["contrast_id"],
             "statistic": item["statistic"],
             "p_raw": item["p"],
             "p_adj": float(p_adj),
@@ -1480,9 +1577,22 @@ def _multi_group_payload(ctx: _Ctx, groups: list[tuple[str, np.ndarray]],
     primary_effect = anova["eta2"] if primary == "anova" else kruskal["epsilon2"]
     annotation = {
         "groups": labels_list,
+        "factor": factor,
+        "x_label": x_label,
+        "contrasts": [
+            {"contrast_id": item["contrast_id"], "contrast": item["contrast"],
+             "a": item["a"], "b": item["b"], "p_adj": float(p_adj),
+             "test": item["effect_name"]}
+            for item, p_adj in zip(pair_raw, adjusted)
+        ],
         "pairs": [
-            {"a": item["a"], "b": item["b"], "p_adj": float(p_adj),
-             "stars": C.p_stars(p_adj), "label": _annot_label(p_adj, ctx.style)}
+            {"a": item["a"], "b": item["b"],
+             "contrast_id": item["contrast_id"], "contrast": item["contrast"],
+             "p_raw": float(item["p"]), "p_adj": float(p_adj),
+             "stars": C.p_stars(p_adj), "label": _annot_label(p_adj, ctx.style),
+             "test": _TEST_LABELS[primary],
+             "n_a": int(next(arr.size for label, arr in groups if label == item["a"])),
+             "n_b": int(next(arr.size for label, arr in groups if label == item["b"]))}
             for item, p_adj in zip(pair_raw, adjusted)
         ],
         "test": _TEST_LABELS[primary],
@@ -1526,6 +1636,8 @@ def _multi_group_payload(ctx: _Ctx, groups: list[tuple[str, np.ndarray]],
         "effect": primary_effect,
         "n_sig_pairs": n_sig,
         "test": _TEST_LABELS[primary],
+        "factor": factor,
+        "contrasts": len(pair_rows),
     }
     return {
         "bullets": bullets,
@@ -1538,8 +1650,134 @@ def _multi_group_payload(ctx: _Ctx, groups: list[tuple[str, np.ndarray]],
     }
 
 
+def _matrix_view_guard(ctx: _Ctx) -> bool:
+    """矩阵融化视图的生物学 n 保护：默认拒绝推断，除非显式声明独立样本。"""
+    if not ctx.data.get("melted"):
+        return False
+    declared = _p_str(ctx.params, "independent_samples").lower()
+    if declared not in ("sample", "independent"):
+        raise C.prerequisite(
+            "矩阵数据（特征×样本）已融化为长表：同一个样本里的多个特征值是技术重复，"
+            "不是独立生物学重复，默认拒绝做组间检验。若确认每个样本本身就是独立观测单位，"
+            "请显式传 independent_samples=\"sample\"（结果会记录 sample_unit，并保留技术重复提示）；"
+            "否则请先在样本水平汇总，或改用热图/相关/PCA 等描述性图表。"
+        )
+    ctx.warnings.append(
+        "已按 independent_samples=\"sample\" 显式声明样本为独立观测单位：本次比较的重复单位是样本，"
+        "样本内多个特征值仍属技术重复；n 按样本数计，不按特征数计。"
+    )
+    return True
+
+
+def _aggregate_melted_samples(ctx: _Ctx) -> None:
+    """矩阵融化视图在显式声明独立样本后：先按样本聚合（样本内特征均值），再按样本分组比较。
+
+    这样 n = 样本数，而不是把同一生物样本的 5 个特征值当成 5 个独立重复。
+    """
+    data = dict(ctx.data)
+    tidy = data.get("tidy")
+    if tidy is None or "__x" not in tidy.columns or "__y" not in tidy.columns:
+        return
+    if "__group" not in tidy.columns or int(tidy["__group"].nunique(dropna=True)) < 2:
+        raise C.prerequisite(
+            "矩阵数据没有可用的样本分组：请在样本表里指定 group 列（或先挂载样本信息），"
+            "否则无法按样本单位做组间比较"
+        )
+    work = tidy.loc[tidy["__y"].notna() & tidy["__x"].notna()]
+    if work.empty:
+        raise C.prerequisite("矩阵数据融化后没有可用于聚合的数值")
+    grouped = work.groupby("__x", observed=True, sort=False).agg(
+        __group=("__group", "first"), __y=("__y", "mean"))
+    frame = pd.DataFrame({
+        "__x": grouped["__group"].astype(object).to_numpy(),
+        "__y": grouped["__y"].to_numpy(dtype=float),
+        "__sample": [str(index) for index in grouped.index],
+    })
+    labels = dict(data.get("labels") or {})
+    group_name = labels.get("group") or labels.get("x") or "group"
+    data["tidy"] = frame.reset_index(drop=True)
+    data["labels"] = {**labels, "x": str(group_name), "y": labels.get("y") or "value"}
+    data["levels"] = {"x": [str(value) for value in pd.unique(frame["__x"])]}
+    data["notes"] = list(data.get("notes") or []) + [
+        "矩阵数据已按样本聚合（每个样本取其全部特征的均值）后再按样本分组比较："
+        "n=样本数，样本内特征值仍为技术重复"
+    ]
+    ctx.data = data
+    ctx.warnings.append(
+        "矩阵数据已按样本聚合（样本内特征均值）后比较：生物学重复单位是样本，"
+        "每组 n=样本数，不把样本内特征值当独立重复"
+    )
+
+
+def _pairing_id_column(ctx: _Ctx, params: Mapping[str, Any]) -> str | None:
+    explicit = _p_str(params, "paired_id") or _p_str(params, "id")
+    if explicit:
+        return explicit
+    candidate = ctx.dataset.get("id_col")
+    if candidate and candidate in ctx.df.columns:
+        return str(candidate)
+    return None
+
+
+def _align_pair_groups(ctx: _Ctx, groups: list[tuple[str, np.ndarray]],
+                       id_col: str) -> tuple[list[tuple[str, np.ndarray]], int]:
+    """按配对 ID 把两组观测对齐；集合不一致、组内重复、ID 缺失都报 bad_request。"""
+    escape = (
+        "；如确认行顺序就是配对顺序，可显式设 pairing=\"row_order\" 走逃生门"
+        "（按各组出现顺序配对，行序不同会静默错配，结果不可信）"
+    )
+    if id_col not in ctx.df.columns:
+        raise C.bad_request(f"配对列「{id_col}」不在数据里：请检查 paired_id" + escape)
+    roles = dict(ctx.roles())
+    roles["id"] = id_col
+    frame, _labels, _levels, _notes = P.tidy_frame(
+        ctx.dataset, roles, ("x", "y"), ("id",), drop_na=True)
+    if "__id" not in frame.columns:
+        raise C.bad_request(f"无法从列「{id_col}」建立配对 ID" + escape)
+    if frame["__id"].isna().any():
+        raise C.bad_request(f"配对 ID 列「{id_col}」存在缺失值：配对要求每个观测都有 ID" + escape)
+    work = frame.loc[frame["__y"].notna() & frame["__x"].notna()]
+    maps: dict[str, dict[str, float]] = {}
+    for raw in pd.unique(work["__x"].dropna()):
+        label = _label(raw)
+        sub = work.loc[work["__x"] == raw]
+        ids = sub["__id"].astype(str)
+        duplicated = sorted(set(ids[ids.duplicated()].tolist()))
+        if duplicated:
+            raise C.bad_request(
+                f"配对 ID 在「{label}」组内重复：{'、'.join(duplicated[:5])}"
+                f"（配对要求每个 ID 在每组各出现一次）" + escape
+            )
+        maps[label] = dict(zip(ids.tolist(), sub["__y"].to_numpy(dtype=float)))
+    la, lb = groups[0][0], groups[1][0]
+    if la not in maps or lb not in maps:
+        raise C.bad_request(f"配对 ID 对齐失败：分组「{la}」「{lb}」与配对框架不一致" + escape)
+    left, right = maps[la], maps[lb]
+    missing_left = sorted(set(right) - set(left))
+    missing_right = sorted(set(left) - set(right))
+    if missing_left or missing_right:
+        pieces = []
+        if missing_left:
+            pieces.append(f"仅 {lb} 有 {len(missing_left)} 个 ID（如 {'、'.join(missing_left[:5])}）")
+        if missing_right:
+            pieces.append(f"仅 {la} 有 {len(missing_right)} 个 ID（如 {'、'.join(missing_right[:5])}）")
+        raise C.bad_request("配对 ID 集合两侧不一致：" + "；".join(pieces) + escape)
+    common = sorted(set(left) & set(right))
+    if len(common) < 3:
+        raise C.prerequisite(f"完整配对数只有 {len(common)} 对（<3），无法做配对检验")
+    arr_a = np.asarray([left[key] for key in common], dtype=float)
+    arr_b = np.asarray([right[key] for key in common], dtype=float)
+    ctx.warnings.append(
+        f"配对按 ID 列「{id_col}」对齐：{len(common)} 对完整观测，两侧 ID 集合一致"
+    )
+    return [(la, arr_a), (lb, arr_b)], len(common)
+
+
 def _run_compare(ctx: _Ctx) -> dict:
     params = ctx.params
+    melted = _matrix_view_guard(ctx)
+    if melted:
+        _aggregate_melted_samples(ctx)
     groups, labels = _grouped_values(ctx, min_n=2, purpose="组间比较")
     method_req = _p_select(params, "method", ("auto", "welch", "student", "wilcox", "anova", "kruskal"), "auto")
     paired = _p_bool(params, "paired", False)
@@ -1550,8 +1788,33 @@ def _run_compare(ctx: _Ctx) -> dict:
     x_label = str(labels.get("x") or "分组")
     if paired and len(groups) > 2:
         raise C.bad_request("配对检验目前只支持 2 组；多组配对请改用重复测量模型")
-    payload = (_two_group_payload(ctx, groups, method_req, paired, adjust, reps, y_label)
-               if len(groups) == 2 else _multi_group_payload(ctx, groups, method_req, adjust, y_label))
+    pairing_basis = "independent"
+    n_pairs: int | None = None
+    if paired:
+        pairing = _p_select(params, "pairing", ("auto", "id", "row_order"), "auto")
+        if pairing == "row_order":
+            pairing_basis = "row_order"
+            ctx.warnings.append(
+                "pairing=\"row_order\" 逃生门：按各组在数据中的出现顺序（行序）配对；"
+                "若行序不是配对顺序，会静默错配，务必人工确认"
+            )
+        else:
+            id_col = _pairing_id_column(ctx, params)
+            if not id_col:
+                raise C.bad_request(
+                    "配对检验需要配对 ID（参数 paired_id，或数据里的 ID 列）：当前没有可用 ID 列。"
+                    "请指定 paired_id=列名 / pairing=\"id\"，或显式设 pairing=\"row_order\" "
+                    "走逃生门——它按各组出现顺序配对，行序不同会静默错配，结果不可信。"
+                )
+            groups, n_pairs = _align_pair_groups(ctx, groups, id_col)
+            pairing_basis = "id"
+    payload = (_two_group_payload(ctx, groups, method_req, paired, adjust, reps, y_label,
+                                  x_label=x_label, pairing_basis=pairing_basis,
+                                  n_pairs=n_pairs)
+               if len(groups) == 2 else _multi_group_payload(ctx, groups, method_req, adjust, y_label,
+                                                             x_label=x_label))
+    if melted:
+        payload["key_numbers"]["sample_unit"] = "sample"
     extra = f"分组变量：`{x_label}`；因变量：`{y_label}`"
     result = _pack(
         title="组间比较",
@@ -3530,7 +3793,10 @@ def _run_adjust(ctx: _Ctx) -> dict:
             raise C.prerequisite(f"列「{column}」里没有有效 p 值（全部缺失或无法解析）")
 
     if len(values) > 1000:
-        raise C.bad_request(f"p 值过多（{len(values)} > 1000），请分批校正")
+        ctx.warnings.append(
+            f"p 值家族较大（{len(values)} > 1000）：已按整个家族一次性校正（FDR 的家族定义必须覆盖全部受检假设）；"
+            "如需分批校正，请自行拆分，但分批会改变校正家族、使 q 值不可直接比较"
+        )
     invalid = [(name, value) for name, value in zip(names, values) if not (0.0 <= value <= 1.0)]
     if invalid:
         text = "、".join(f"{name}={C.fmt_num(value)}" for name, value in invalid[:5])

@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import csv
 import datetime as _dt
+import hashlib
 import io as _io
+import json
 import os
 import re
 import time
@@ -26,6 +28,8 @@ import pl_state as S
 MAX_DATASETS = 12
 MAX_HISTORY = 40
 MAX_FIGURES = 200
+MAX_FIGURE_RUNS = 200
+FIGURE_RUN_VERSION = 1
 
 # 图表/统计模块可能由并行开发者维护，导入放在函数内（缺模块时给可读错误而不是启动失败）
 def _charts():
@@ -146,15 +150,57 @@ CLEAN_HINTS = [
 ]
 
 
-def _match_keyword(text: str, table: Sequence[tuple[str, str]]) -> str | None:
+# 否定词（含常见“不要/无需”变体）：命中窗口内出现即视为该触发词被否定
+# 注意：「去掉/删除」对清洗是肯定动词（去掉重复=去重），不是否定词，不能列入
+_NEGATION_TOKENS = ("不", "别", "勿", "无需", "无须", "不用", "不要", "禁止", "取消",
+                    "没有", "未")
+_NEGATION_WINDOW = 8
+_CLAUSE_DELIMITERS = "，,。;；、！？!?\n"
+
+
+def _negated_at(text: str, start: int) -> bool:
+    """同一分句内、触发词前 8 个字符里是否出现否定词。
+
+    分句边界（逗号/句号/分号/顿号…）会截断否定作用域：
+    “不画箱线图，画柱状图”只否定箱线图，“不删除重复”否定去重。
+    """
+    clause_start = 0
+    for delimiter in _CLAUSE_DELIMITERS:
+        position = text.rfind(delimiter, 0, start)
+        if position + 1 > clause_start:
+            clause_start = position + 1
+    prefix = text[max(clause_start, start - _NEGATION_WINDOW):start]
+    return any(token in prefix for token in _NEGATION_TOKENS)
+
+
+def _first_active_hit(text: str, needle: str) -> int:
+    """返回第一个未被否定的 needle 位置；没有则 -1。"""
     lowered = text.lower()
+    key = str(needle).lower()
+    if not key:
+        return -1
+    index = lowered.find(key)
+    while index >= 0:
+        if not _negated_at(lowered, index):
+            return index
+        index = lowered.find(key, index + len(key))
+    return -1
+
+
+def _first_active_regex(text: str, pattern: str) -> int:
+    """正则版：返回第一个未被否定的匹配起点；没有则 -1。"""
+    for match in re.finditer(pattern, text):
+        if not _negated_at(text, match.start()):
+            return match.start()
+    return -1
+
+
+def _match_keyword(text: str, table: Sequence[tuple[str, str]]) -> str | None:
     best: tuple[int, str] | None = None
     for keyword, value in table:
-        key = keyword.lower()
-        if key in lowered:
-            index = lowered.find(key)
-            if best is None or index < best[0]:
-                best = (index, value)
+        index = _first_active_hit(text, keyword)
+        if index >= 0 and (best is None or index < best[0]):
+            best = (index, value)
     return best[1] if best else None
 
 
@@ -193,15 +239,22 @@ def parse_need(need: str, dataset: Mapping[str, Any]) -> dict:
         if saved_roles.get(key):
             roles[key] = saved_roles[key]
 
-    # ---- 统计关键词 ----
+    # ---- 统计关键词（否定词保护：“不做显著性”不触发 compare）----
     for keyword, stat_id in STAT_KEYWORDS:
-        if keyword.lower() in lowered and stat_id not in stat_ids:
+        if _first_active_hit(lowered, keyword) >= 0 and stat_id not in stat_ids:
             stat_ids.append(stat_id)
 
-    # ---- 清洗关键词 ----
+    # ---- 清洗关键词（否定词保护 + 固定优先级）----
+    # 优先级：空列 → 重复 → 缺失 → 异常值 → 变换；与文本出现顺序无关，保证计划可复现。
+    negated_hints: list[str] = []
     for pattern, name in CLEAN_HINTS:
-        if re.search(pattern, lowered) and name not in cleaning_request:
-            cleaning_request.append(name)
+        if _first_active_regex(lowered, pattern) >= 0:
+            if name not in cleaning_request:
+                cleaning_request.append(name)
+        elif re.search(pattern, lowered):
+            negated_hints.append(name)
+    if negated_hints:
+        notes.append("已识别否定清洗指令并跳过：" + "、".join(negated_hints))
 
     # ---- 分组列：按 X 分组 / group by X / color by X ----
     group_col = None
@@ -354,10 +407,15 @@ def parse_need(need: str, dataset: Mapping[str, Any]) -> dict:
         if chart_id == "stack":
             params["normalize"] = True
 
-    # ---- 清洗计划 ----
-    cleaning_steps = _cleaning_from_hints(dataset, cleaning_request)
-    if not cleaning_request:
-        cleaning_steps = []
+    # ---- 清洗计划（固定优先级；保护 ID/分组/端点列）----
+    cleaning_steps = []
+    for name in ("empty", "duplicate", "missing", "outlier", "log", "zscore"):
+        if name in cleaning_request:
+            cleaning_steps.extend(_cleaning_from_hints(dataset, [name]))
+    if cleaning_request:
+        notes.append("清洗优先级：" + " → ".join(name for name in
+                                            ("empty", "duplicate", "missing", "outlier", "log", "zscore")
+                                            if name in cleaning_request))
 
     steps = []
     for item in cleaning_steps:
@@ -411,32 +469,57 @@ def _cleaning_from_hints(dataset: Mapping[str, Any], hints: Sequence[str]) -> li
     if df is None:
         return []
     columns = dataset.get("columns") or P.column_summaries(df)
-    numeric = [c["key"] for c in columns if c.get("dtype") == "numeric"]
+    protected = pl_clean.protected_columns(dataset)
+    numeric = [c["key"] for c in columns
+               if c.get("dtype") == "numeric" and str(c["key"]) not in protected]
     steps: list[dict] = []
     if "empty" in hints:
-        empty = [c["key"] for c in columns if int(c.get("missing") or 0) >= len(df)]
+        empty = [c["key"] for c in columns
+                 if int(c.get("missing") or 0) >= len(df) and str(c["key"]) not in protected]
         if empty:
             steps.append({"op": "drop_empty", "params": {"columns": empty}, "reason": "删除全空列"})
+        kept = [c["key"] for c in columns
+                if int(c.get("missing") or 0) >= len(df) and str(c["key"]) in protected]
+        if kept:
+            steps.append({"op": "none", "params": {},
+                          "reason": f"全空列 {'、'.join(str(c) for c in kept[:5])} 属受保护列，跳过删除"})
     if "duplicate" in hints:
         steps.append({"op": "drop_duplicates", "params": {}, "reason": "删除完全重复的行"})
     if "missing" in hints:
-        cols = [c["key"] for c in columns if 0 < int(c.get("missing") or 0) < len(df)]
-        if cols:
-            steps.append({"op": "impute", "params": {"columns": [c for c in cols if c in numeric], "method": "median"},
-                          "reason": "数值列缺失用中位数填补"})
-            others = [c for c in cols if c not in numeric]
-            if others:
-                steps.append({"op": "dropna", "params": {"columns": others, "how": "any"},
-                              "reason": "分类列缺失的行删除"})
+        cols = [c["key"] for c in columns
+                if 0 < int(c.get("missing") or 0) < len(df) and str(c["key"]) not in protected]
+        target_numeric = [c for c in cols if c in numeric]
+        if target_numeric:
+            steps.append({"op": "impute", "params": {"columns": target_numeric, "method": "median"},
+                          "reason": "数值列按列独立用中位数填补"})
+        others = [c for c in cols if c not in numeric]
+        if others:
+            steps.append({"op": "dropna", "params": {"columns": others, "how": "any"},
+                          "reason": "分类列按列独立删除缺失行"})
+        kept = [c["key"] for c in columns
+                if 0 < int(c.get("missing") or 0) < len(df) and str(c["key"]) in protected]
+        endpoints = pl_clean.endpoint_columns(dataset)
+        fillable = [c for c in kept if c not in endpoints]
+        endpoint_missing = [c for c in kept if c in endpoints]
+        if fillable:
+            steps.append({"op": "dropna", "params": {"columns": fillable, "how": "any"},
+                          "reason": "受保护列（ID/分组）有缺失：不填补，按列删除缺失行"})
+        if endpoint_missing:
+            steps.append({"op": "dropna", "params": {"columns": endpoint_missing, "how": "any"},
+                          "reason": "端点列有缺失：不填补（避免伪造结局），按列删除缺失行"})
     if "outlier" in hints:
-        steps.append({"op": "outlier", "params": {"columns": numeric[:8], "method": "iqr", "action": "winsorize"},
-                      "reason": "异常值缩尾到 1.5×IQR"})
+        if numeric:
+            steps.append({"op": "outlier", "params": {"columns": numeric[:8], "method": "iqr",
+                                                      "action": "winsorize"},
+                          "reason": "异常值缩尾到 1.5×IQR（仅数值列，保护 ID/分组/端点）"})
+        else:
+            steps.append({"op": "none", "params": {}, "reason": "没有可处理的数值列（或全部受保护）"})
     if "log" in hints and numeric:
         steps.append({"op": "transform", "params": {"columns": numeric[:8], "method": "log2"},
-                      "reason": "对数值列做 log2 变换"})
+                      "reason": "对数值列做 log2 变换（保护 ID/分组/端点）"})
     if "zscore" in hints and numeric:
         steps.append({"op": "transform", "params": {"columns": numeric[:8], "method": "zscore"},
-                      "reason": "对数值列做 z-score 标准化"})
+                      "reason": "对数值列做 z-score 标准化（保护 ID/分组/端点）"})
     return steps
 
 
@@ -452,6 +535,104 @@ def _dataset_groups(dataset: Mapping[str, Any]) -> list[str] | None:
         if column and column in info.columns:
             return [str(v) for v in pd.unique(info[column].dropna().astype(str))][:60]
     return None
+
+
+# ---------------------------------------------------------------------------
+# 出图 run：figure_run_id 固化的图版本（源数据 digest + 参数 + 样式 + 角色 + 图层 + 统计表）
+# ---------------------------------------------------------------------------
+
+def data_digest(dataset: Mapping[str, Any]) -> str:
+    """当前分析数据的稳定指纹：数据内容 + 清洗记录（清洗后必须视为新源数据）。"""
+    digest = hashlib.sha1()
+    df = dataset.get("df")
+    digest.update(str(dataset.get("kind") or "").encode("utf-8"))
+    if df is not None:
+        digest.update("|".join(str(c) for c in df.columns).encode("utf-8"))
+        digest.update(str(df.shape).encode("utf-8"))
+        try:
+            hashes = pd.util.hash_pandas_object(df, index=False).to_numpy()
+            digest.update(hashes.tobytes())
+        except Exception:  # noqa: BLE001 - 混合类型兜底
+            digest.update(df.astype(str).to_csv(index=False).encode("utf-8"))
+    cleaning = [
+        {"op": step.get("op"), "params": step.get("params"), "reason": step.get("reason")}
+        for step in (dataset.get("cleaning") or [])
+    ]
+    digest.update(json.dumps(cleaning, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(C.jsonable(value), sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _figure_run_key(dataset: Mapping[str, Any], chart_id: str, params: Mapping[str, Any],
+                    style: Mapping[str, Any], roles: Mapping[str, Any]) -> dict:
+    return {
+        "dataset_id": dataset.get("id"),
+        "data_digest": data_digest(dataset),
+        "kind": dataset.get("kind"),
+        "feature_col": dataset.get("feature_col"),
+        "chart": chart_id,
+        "params": C.jsonable(dict(params or {})),
+        "style": C.jsonable(dict(style or {})),
+        "roles": {str(k): v for k, v in (roles or {}).items() if v},
+    }
+
+
+def _figure_run_id(key: Mapping[str, Any]) -> str:
+    return "fr_" + hashlib.sha1(_canonical(key).encode("utf-8")).hexdigest()[:16]
+
+
+def _figure_layers(data: Mapping[str, Any], chart_id: str, params: Mapping[str, Any],
+                   style: Mapping[str, Any], stats: Any, annotations: Any) -> list[dict]:
+    """描述这张图实际由哪些层组成（数据层/图元层/推断层/标注层/样式层）。"""
+    tidy = data.get("tidy")
+    layers: list[dict] = [{
+        "id": "data",
+        "kind": data.get("kind"),
+        "view": data.get("view") or data.get("kind"),
+        "melted": bool(data.get("melted")),
+        "n_rows": int(len(tidy)) if tidy is not None else None,
+        "n_dropped": data.get("n_dropped"),
+    }]
+    layers.append({"id": "mark", "chart": chart_id, "params": C.jsonable(dict(params or {}))})
+    if stats:
+        layers.append({
+            "id": "inference",
+            "method": (stats or {}).get("method"),
+            "p_adjust": (stats or {}).get("p_adjust"),
+            "factor": (stats or {}).get("factor"),
+            "contrasts": len((stats or {}).get("contrasts") or (stats or {}).get("pairs") or []),
+        })
+    else:
+        layers.append({"id": "inference", "method": None, "note": "no test drawn"})
+    if annotations:
+        layers.append({"id": "annotation", "payload": C.jsonable(annotations)})
+    layers.append({
+        "id": "style",
+        "palette": style.get("palette"), "theme": style.get("theme"),
+        "dpi": style.get("dpi"),
+        "size": [style.get("fig_width"), style.get("fig_height")],
+    })
+    return layers
+
+
+def _figure_intervals(tables: Sequence[Mapping[str, Any]]) -> list[dict]:
+    """把图上实际使用的误差/置信区间记录进 run（有则记录，无则空表）。"""
+    intervals: list[dict] = []
+    for table in tables or []:
+        if str(table.get("id")) != "aggregate":
+            continue
+        keys = {str(c.get("key")) for c in table.get("columns") or []}
+        if "error" not in keys:
+            continue
+        for row in table.get("rows") or []:
+            intervals.append({
+                "x": row.get("x"), "group": row.get("group"),
+                "n": row.get("n"), "value": row.get("value"), "error": row.get("error"),
+            })
+    return C.jsonable(intervals)
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +658,7 @@ class WorkerState:
         self.active: str | None = None
         self.seq = 0
         self.figures: OrderedDict[str, dict] = OrderedDict()
+        self.figure_runs: OrderedDict[str, dict] = OrderedDict()
         self.started_at = _dt.datetime.now().astimezone().isoformat(timespec="seconds")
         self.last_plot: dict | None = None
         self.progress_cb = None
@@ -676,6 +858,7 @@ class WorkerState:
         self.datasets.clear()
         self.active = None
         self.figures.clear()
+        self.figure_runs.clear()
         self.last_plot = None
         return {"ok": True, "datasets": [], "active": None}
 
@@ -714,6 +897,8 @@ class WorkerState:
                     "chart": entry.get("chart"),
                     "chart_title": entry.get("chart_title"),
                     "figure": entry.get("figure"),
+                    "figure_run_id": entry.get("figure_run_id"),
+                    "data_digest": entry.get("data_digest"),
                     "at": entry.get("at"),
                     "need": entry.get("need"),
                 }
@@ -844,7 +1029,8 @@ class WorkerState:
         if plan is not None and not isinstance(plan, list):
             raise C.bad_request("plan 需要是步骤列表")
         auto = bool(args.get("auto")) or not plan
-        report = pl_clean.apply_clean(dataset, plan=plan, auto=auto)
+        dry_run = bool(args.get("preview") or args.get("dry_run"))
+        report = pl_clean.apply_clean(dataset, plan=plan, auto=auto, dry_run=dry_run)
         report["dataset"] = self.dataset_summary(dataset, with_columns=False)
         return report
 
@@ -885,6 +1071,91 @@ class WorkerState:
             payload["roles_current"] = {k: v for k, v in (dataset.get("roles") or {}).items() if v}
         return payload
 
+    # ---- 出图 run：渲染 + 固化 ----
+
+    def _figure_run(self, dataset: Mapping[str, Any], chart_id: str, meta: Mapping[str, Any],
+                    params: Mapping[str, Any], style: Mapping[str, Any],
+                    roles: Mapping[str, Any]) -> dict:
+        """按 (源数据 digest, chart, params, style, roles) 取或建一个 figure run。
+
+        同一请求复用已固化的 run（含 PNG 路径）；任一要素变化都会新建 run 并重画。
+        """
+        key = _figure_run_key(dataset, chart_id, params, style, roles)
+        run_id = _figure_run_id(key)
+        cached = self.figure_runs.get(run_id)
+        if cached is not None:
+            files = [str(item.get("file")) for item in cached.get("figures") or []]
+            if files and all(os.path.isfile(path) for path in files):
+                return cached
+        started = time.perf_counter()
+        data = self._build_data(dataset, meta, params, roles)
+        result = _charts().render(chart_id, data, params, style, self.dirs["figures"])
+        figures = self._register_figures(result.get("figures"))
+        if not figures:
+            raise C.EngineError("internal", "图表渲染没有产出图片")
+        python_code = ""
+        r_code = ""
+        try:
+            python_code = _codegen().build_script(dataset, chart_id, meta, data, params, style, roles)
+            r_code = _codegen().chart_r_code(chart_id, data, params, style)
+        except Exception as error:  # noqa: BLE001 - 代码生成失败不影响出图
+            result.setdefault("warnings", []).append(f"代码生成失败：{error}")
+        warnings = list(dict.fromkeys(
+            [str(item) for item in (result.get("warnings") or [])]
+            + [str(item) for item in (data.get("notes") or [])]
+        ))
+        tables = C.jsonable(result.get("tables") or [])
+        stats = C.jsonable(result.get("stats"))
+        annotations = C.jsonable(result.get("annotations"))
+        tidy = data.get("tidy")
+        run = {
+            "figure_run_id": run_id,
+            "version": FIGURE_RUN_VERSION,
+            "key": C.jsonable(key),
+            "dataset_id": dataset.get("id"),
+            "dataset_name": dataset.get("name"),
+            "data_digest": key["data_digest"],
+            "kind": dataset.get("kind"),
+            "chart": chart_id,
+            "chart_title": meta.get("title") or chart_id,
+            "params": C.jsonable(dict(params or {})),
+            "style": C.jsonable(dict(style or {})),
+            "roles": {k: v for k, v in (roles or {}).items() if v},
+            "labels": C.jsonable(data.get("labels") or {}),
+            "figures": figures,
+            "figure": figures[0],
+            "summary": C.jsonable(result.get("summary") or {}),
+            "tables": tables,
+            "layers": _figure_layers(data, chart_id, params, style, stats, annotations),
+            "confidence_intervals": _figure_intervals(tables),
+            "stats": stats,
+            "annotations": annotations,
+            "warnings": warnings,
+            "code": {"python": python_code, "r": r_code},
+            "data_meta": {"kind": data.get("kind"), "view": data.get("view"),
+                          "melted": bool(data.get("melted")),
+                          "n_dropped": data.get("n_dropped"),
+                          "n_rows": int(len(tidy)) if tidy is not None else None},
+            "at": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+        }
+        self.figure_runs[run_id] = run
+        while len(self.figure_runs) > MAX_FIGURE_RUNS:
+            self.figure_runs.popitem(last=False)
+        return run
+
+    def _figure_run_view(self, run: Mapping[str, Any]) -> dict:
+        keys = ("figure_run_id", "version", "chart", "chart_title", "params", "style", "roles",
+                "tables", "layers", "confidence_intervals", "stats", "annotations", "summary",
+                "dataset_id", "data_digest", "at", "data_meta", "figure", "figures")
+        return C.jsonable({key: run.get(key) for key in keys if key in run})
+
+    def get_figure_run(self, run_id: str) -> dict:
+        run = self.figure_runs.get(str(run_id or ""))
+        if run is None:
+            raise C.not_found(f"没有这个 figure run：{run_id}（可用 op_records 查看历史 run）")
+        return run
+
     def op_plot(self, args: Mapping[str, Any]) -> dict:
         dataset = self.get(args.get("dataset"))
         chart_id = str(args.get("chart") or args.get("kind") or "").strip()
@@ -896,57 +1167,50 @@ class WorkerState:
         roles = args.get("roles") if isinstance(args.get("roles"), dict) else None
         if roles is None:
             roles = P.recommend_roles(dataset, meta)
+        roles = {k: v for k, v in (roles or {}).items() if v}
         started = time.perf_counter()
-        data = self._build_data(dataset, meta, params, roles)
-        result = _charts().render(chart_id, data, params, style, self.dirs["figures"])
-        figures = self._register_figures(result.get("figures"))
+        run = self._figure_run(dataset, chart_id, meta, params, style, roles)
         elapsed = int((time.perf_counter() - started) * 1000)
-        python_code = ""
-        r_code = ""
-        try:
-            python_code = _codegen().build_script(dataset, chart_id, meta, data, params, style, roles)
-            r_code = _codegen().chart_r_code(chart_id, data, params, style)
-        except Exception as error:  # noqa: BLE001 - 代码生成失败不影响出图
-            result.setdefault("warnings", []).append(f"代码生成失败：{error}")
-        chart_payload = {
-            "figure": figures[0] if figures else None,
-            "figures": figures,
+        payload = {
+            "figure": run.get("figure"),
+            "figures": run.get("figures") or [],
+            "figure_run_id": run.get("figure_run_id"),
+            "figure_run": self._figure_run_view(run),
             "chart": chart_id,
-            "chart_title": meta.get("title") or chart_id,
-            "params": C.jsonable(params),
-            "style": C.jsonable(style),
-            "roles": {k: v for k, v in (roles or {}).items() if v},
-            "labels": data.get("labels") or {},
-            "summary": result.get("summary") or {},
-            "tables": result.get("tables") or [],
-            "warnings": list(dict.fromkeys(list(result.get("warnings") or []) + list(data.get("notes") or []))),
-            "stats": C.jsonable(result.get("stats")),
-            "annotations": C.jsonable(result.get("annotations")),
-            "code": {"python": python_code, "r": r_code},
-            "data_meta": {"kind": data.get("kind"), "n_dropped": data.get("n_dropped"),
-                          "n_rows": int(data["tidy"].shape[0]) if data.get("tidy") is not None else None},
+            "chart_title": run.get("chart_title") or meta.get("title") or chart_id,
+            "params": run.get("params"),
+            "style": run.get("style"),
+            "roles": run.get("roles"),
+            "labels": run.get("labels") or {},
+            "summary": run.get("summary") or {},
+            "tables": run.get("tables") or [],
+            "warnings": run.get("warnings") or [],
+            "stats": run.get("stats"),
+            "annotations": run.get("annotations"),
+            "code": run.get("code") or {"python": "", "r": ""},
+            "data_meta": run.get("data_meta"),
             "elapsed_ms": elapsed,
             "dataset": self.dataset_summary(dataset, with_columns=False),
         }
-        if not figures:
-            raise C.EngineError("internal", "图表渲染没有产出图片")
-        # 历史 & 最近一次
+        # 历史 & 最近一次（导出/取回都按 figure_run_id 绑定，不再靠"最后一次"猜）
         dataset.setdefault("history", []).append(
             {
                 "id": C.unique_id("h_"),
                 "chart": chart_id,
-                "chart_title": meta.get("title") or chart_id,
-                "params": C.jsonable(params),
-                "style": C.jsonable(style),
-                "roles": {k: v for k, v in (roles or {}).items() if v},
-                "figure": figures[0],
+                "chart_title": payload["chart_title"],
+                "params": payload["params"],
+                "style": payload["style"],
+                "roles": payload["roles"],
+                "figure": run.get("figure"),
+                "figure_run_id": run.get("figure_run_id"),
+                "data_digest": run.get("data_digest"),
                 "at": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
                 "need": dataset.get("need") or "",
             }
         )
         dataset["history"] = dataset["history"][-MAX_HISTORY:]
-        self.last_plot = chart_payload
-        return chart_payload
+        self.last_plot = payload
+        return payload
 
     def op_stat(self, args: Mapping[str, Any]) -> dict:
         dataset = self.get(args.get("dataset"))
@@ -1021,6 +1285,8 @@ class WorkerState:
             "cleaning": cleaning_report,
             "figure": chart_result.get("figure"),
             "figures": chart_result.get("figures"),
+            "figure_run_id": chart_result.get("figure_run_id"),
+            "figure_run": chart_result.get("figure_run"),
             "chart": chart_result.get("chart"),
             "chart_title": chart_result.get("chart_title"),
             "params": chart_result.get("params"),
@@ -1068,15 +1334,68 @@ class WorkerState:
         return {"chart": chart_id, "python": python_code, "r": r_code,
                 "filename": f"plotlab_{chart_id}.py"}
 
+    def _resolve_export_run(self, dataset: Mapping[str, Any], args: Mapping[str, Any],
+                            last: Mapping[str, Any] | None) -> dict:
+        """把导出请求解析成一个 figure run：同请求复用，参数/样式/角色/数据变化则重画。"""
+        archived_id = str(args.get("figure_run_id") or "").strip()
+        if archived_id:
+            overridden = any(args.get(key) is not None for key in ("chart", "params", "style", "roles"))
+            if not overridden:
+                run = self.get_figure_run(archived_id)
+                if run.get("dataset_id") != dataset.get("id"):
+                    raise C.bad_request(
+                        f"figure run {archived_id} 属于数据集 {run.get('dataset_id')}，不是当前数据集"
+                    )
+                return run
+        chart_id = str(args.get("chart") or args.get("kind") or "").strip()
+        if not chart_id and last:
+            chart_id = str(last.get("chart") or "")
+        if not chart_id:
+            history = dataset.get("history") or []
+            if history:
+                chart_id = str(history[-1].get("chart") or "")
+        if not chart_id:
+            # 没有 last_plot/history 时回退到本数据集最近一个 figure run（例如先 export what=figure 再导 bundle）
+            for run_id in reversed(list(self.figure_runs)):
+                candidate = self.figure_runs.get(run_id) or {}
+                if candidate.get("dataset_id") == dataset.get("id"):
+                    chart_id = str(candidate.get("chart") or "")
+                    break
+        if not chart_id:
+            raise C.bad_request(
+                "没有可导出的图：请传 chart（图表 id），或先 action=plot / auto 出图再导出"
+            )
+        meta = self._chart_meta(chart_id)
+        same_chart = bool(last) and str(last.get("chart") or "") == chart_id
+        if args.get("params") is not None:
+            params = dict(args.get("params") or {})
+        elif same_chart:
+            params = dict(last.get("params") or {})
+        else:
+            params = {}
+        if args.get("style") is not None:
+            style = self._style(args.get("style"))
+        elif same_chart:
+            style = self._style(last.get("style"))
+        else:
+            style = self._style(None)
+        if isinstance(args.get("roles"), dict):
+            roles = {k: v for k, v in (args.get("roles") or {}).items() if v}
+        elif same_chart and last.get("roles"):
+            roles = {k: v for k, v in (last.get("roles") or {}).items() if v}
+        else:
+            roles = P.recommend_roles(dataset, meta)
+        return self._figure_run(dataset, chart_id, meta, params, style, roles)
+
     def op_export(self, args: Mapping[str, Any]) -> dict:
         dataset = self.get(args.get("dataset"))
         last = self.last_plot if (self.last_plot or {}).get("dataset", {}).get("id") == dataset["id"] else None
-        chart_id = str(args.get("chart") or (last or {}).get("chart") or "")
+        run = self._resolve_export_run(dataset, args, last)
+        chart_id = str(run.get("chart") or "")
         meta = self._chart_meta(chart_id) if chart_id else None
-        params = dict(args.get("params") or (last or {}).get("params") or {})
-        style = self._style(args.get("style") or (last or {}).get("style"))
-        roles = args.get("roles") or (last or {}).get("roles") or (P.recommend_roles(dataset, meta) if meta else {})
-        data = self._build_data(dataset, meta, params, roles) if meta else None
+        style = C.resolve_style(run.get("style"))
+        roles = dict(run.get("roles") or {})
+        params = dict(run.get("params") or {})
         stats_result = None
         if args.get("stat"):
             try:
@@ -1085,27 +1404,45 @@ class WorkerState:
                                              "style": style, "roles": roles})
             except C.EngineError as error:
                 stats_result = {"title": "统计", "summary": {"bullets": [error.message]}, "tables": []}
-        return _export().export(
+        exported = _export().export(
             what=str(args.get("what") or "bundle"),
             dataset=dataset,
             chart_id=chart_id,
             meta=meta,
-            data=data,
+            data=None,
             params=params,
             style=style,
             roles=roles,
             charts_module=_charts(),
             codegen=_codegen(),
             stats_result=stats_result,
-            last_plot=last,
+            last_plot=run,
             outdir=self.dirs["exports"],
             out_path=args.get("out_path"),
             fmt=str(args.get("format") or "png"),
         )
+        exported["figure_run_id"] = run.get("figure_run_id")
+        exported["data_digest"] = run.get("data_digest")
+        exported["chart"] = chart_id
+        if stats_result is not None:
+            exported["stats"] = stats_result
+        return exported
 
     def op_records(self, args: Mapping[str, Any]) -> dict:
         dataset = self.get(args.get("dataset"))
+        requested = str(args.get("figure_run_id") or "").strip()
+        if requested:
+            run = self.get_figure_run(requested)
+            return {"figure_run": self._figure_run_view(run), "figure_run_id": requested}
+        runs = [
+            {"figure_run_id": run.get("figure_run_id"), "chart": run.get("chart"),
+             "chart_title": run.get("chart_title"), "data_digest": run.get("data_digest"),
+             "at": run.get("at"), "figures": C.jsonable(run.get("figures") or [])}
+            for run in self.figure_runs.values()
+            if run.get("dataset_id") == dataset.get("id")
+        ]
         return {"history": self._history_view(dataset), "count": len(dataset.get("history") or []),
+                "figure_runs": runs, "figure_runs_count": len(runs),
                 "need": dataset.get("need") or ""}
 
     # 自检 / 建议

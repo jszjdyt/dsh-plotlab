@@ -650,6 +650,7 @@ def build_data(dataset: Mapping[str, Any], chart_meta: Mapping[str, Any],
     levels: dict[str, list] = {}
     notes: list[str] = []
     n_dropped = 0
+    melted_view = False
 
     if dataset.get("kind") == "matrix":
         if needs == "wide":
@@ -665,6 +666,11 @@ def build_data(dataset: Mapping[str, Any], chart_meta: Mapping[str, Any],
             labels = melted["labels"]
             levels = melted["levels"]
             notes.extend(melted["notes"])
+            melted_view = True
+            notes.append(
+                "矩阵融化视图：x=样本、y=数值、每个样本内 n=特征数（技术重复）；"
+                "汇总图默认只做描述性展示，组间推断需显式声明独立样本（independent_samples=\"sample\"）"
+            )
     else:
         if needs == "wide":
             if wide is None:
@@ -695,6 +701,8 @@ def build_data(dataset: Mapping[str, Any], chart_meta: Mapping[str, Any],
         "levels": levels,
         "n_dropped": n_dropped,
         "wide": wide if (needs == "wide" or wide is not None) else None,
+        "melted": melted_view,
+        "view": "matrix_melted" if melted_view else str(needs),
         "numeric_cols": numeric_columns(dataset),
         "categorical_cols": categorical_columns(dataset),
         "params": params,
