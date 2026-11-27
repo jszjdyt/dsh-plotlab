@@ -1175,6 +1175,8 @@ class WorkerState:
             "figure": run.get("figure"),
             "figures": run.get("figures") or [],
             "figure_run_id": run.get("figure_run_id"),
+            # 导出绑定基线要能校验「导出的图」和「最近一次渲染」是否同一份源数据
+            "data_digest": run.get("data_digest"),
             "figure_run": self._figure_run_view(run),
             "chart": chart_id,
             "chart_title": run.get("chart_title") or meta.get("title") or chart_id,
@@ -1396,6 +1398,18 @@ class WorkerState:
         style = C.resolve_style(run.get("style"))
         roles = dict(run.get("roles") or {})
         params = dict(run.get("params") or {})
+        # 导出绑定基线：默认拿「最近一次真正渲染出来的图」和本次请求比对，这样
+        # 「先画箱线 → 请求导出 bar」会在导出层触发重画分支（旧 bug：直接复制旧 PNG）。
+        # 例外：显式按 figure_run_id 取某个历史版本且不覆盖参数（E6 归档回查）时，
+        # 基线就是这个固定版本本身——用户要的就是旧图，不能重画回最新。
+        pinned = bool(str(args.get("figure_run_id") or "").strip()) and not any(
+            args.get(key) is not None for key in ("chart", "params", "style", "roles"))
+        baseline = run if (pinned or last is None) else last
+
+        def _rerender_export_figure() -> dict:
+            """按本次导出请求重新取/建 figure run：同请求命中缓存，不同则真正重画。"""
+            return self._figure_run(dataset, chart_id, meta, params, style, roles)
+
         stats_result = None
         if args.get("stat"):
             try:
@@ -1416,14 +1430,18 @@ class WorkerState:
             charts_module=_charts(),
             codegen=_codegen(),
             stats_result=stats_result,
-            last_plot=run,
+            last_plot=baseline,
+            figure_run=run,
+            rerender=_rerender_export_figure,
+            frozen=pinned,
             outdir=self.dirs["exports"],
             out_path=args.get("out_path"),
             fmt=str(args.get("format") or "png"),
         )
-        exported["figure_run_id"] = run.get("figure_run_id")
-        exported["data_digest"] = run.get("data_digest")
-        exported["chart"] = chart_id
+        # 导出层已经校验并记录了本次真正导出的 figure_run_id，这里只补缺（不覆盖）
+        exported.setdefault("figure_run_id", run.get("figure_run_id"))
+        exported.setdefault("data_digest", run.get("data_digest"))
+        exported.setdefault("chart", chart_id)
         if stats_result is not None:
             exported["stats"] = stats_result
         return exported

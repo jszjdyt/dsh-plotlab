@@ -3117,16 +3117,152 @@ def _exact_rank_pvalue(a: np.ndarray, b: np.ndarray) -> float | None:
         return None
 
 
-def _corr_pvalue(x: np.ndarray, y: np.ndarray, method: str) -> float:
-    """按方法分派真实零分布：Pearson=t 近似；Spearman=小样本精确置换/AS89；Kendall=tau。"""
-    left = np.asarray(x, dtype=float)
-    right = np.asarray(y, dtype=float)
+# Kendall 精确零分布的置换枚举上限：n<=8 时 n! <= 40320，枚举全部排列得到的是
+# 真实零分布（不是渐近近似），完全可接受；n>8 改走标准正态渐近式。
+_KENDALL_EXACT_MAX_N = 8
+# n -> 「逆序数 → 排列个数」分布（Mahonian 数）；每个 n 只枚举一次后缓存。
+_KENDALL_EXACT_NULL_CACHE: dict[int, tuple[int, ...]] = {}
+
+
+def _kendall_exact_null_counts(n: int) -> tuple[int, ...]:
+    """枚举 n! 个排列，返回逆序数分布（第 i 项 = 逆序数为 i 的排列个数）。
+
+    当 x 严格递增（无并列）时，Kendall tau 只由排列的逆序数 inv 决定：
+        tau = 1 - 4*inv / (n*(n-1))
+    于是枚举全部 n! 个排列就得到 tau 的精确零分布。单次 n=8 最多 40320 个排列，
+    结果按 n 缓存，同一进程内不会重复枚举。
+    """
+    cached = _KENDALL_EXACT_NULL_CACHE.get(n)
+    if cached is not None:
+        return cached
+    from itertools import permutations
+
+    counts = [0] * (n * (n - 1) // 2 + 1)
+    for order in permutations(range(n)):
+        inversions = 0
+        for i in range(n):
+            head = order[i]
+            for j in range(i + 1, n):
+                if head > order[j]:
+                    inversions += 1
+        counts[inversions] += 1
+    result = tuple(counts)
+    _KENDALL_EXACT_NULL_CACHE[n] = result
+    return result
+
+
+def _kendall_exact_pvalue(tau: float, n: int) -> float | None:
+    """小样本 Kendall 精确置换双侧 P；n 超出枚举上限时返回 None。
+
+    精确 p = 「全部 n! 个排列中 |tau_perm| >= |tau_obs| 的比例」。
+    以 tau=1、n=4 为例：4! = 24 个排列里只有完全同序（tau=+1）与完全反序
+    （tau=-1）这 2 个满足 |tau_perm| >= 1，所以 p = 2/24 = 0.083333 —— 这正是
+    scipy.stats.kendalltau 的精确口径，也是旧 Pearson t 近似在 tau=1 时发散成
+    nan 的根因：t 近似假设 r<1，而秩完全同序时 r=1 恰好落在奇点。
+    前提：无并列（tau-a 零分布）。若已知存在并列，请改传原始向量走 scipy 的
+    并列校正口径（_corr_pvalue 的向量接口）。
+    """
+    if n < 3 or n > _KENDALL_EXACT_MAX_N:
+        return None
+    counts = _kendall_exact_null_counts(n)
+    total = math.factorial(n)
+    observed = abs(max(-1.0, min(1.0, float(tau))))  # 数值误差可能给出略超 ±1
+    denominator = n * (n - 1)
+    hits = 0
+    for inversions, count in enumerate(counts):
+        if not count:
+            continue
+        tau_perm = 1.0 - 4.0 * inversions / denominator
+        if abs(tau_perm) >= observed - 1e-12:
+            hits += count
+    return hits / float(total)
+
+
+def _kendall_asymptotic_pvalue(tau: float, n: int) -> float:
+    """大样本 Kendall 双侧 P（标准正态渐近，无并列口径）。
+
+        z = 3 * tau * sqrt(n*(n-1)) / sqrt(2*(2n+5))
+        p = 2 * (1 - Phi(|z|)) = 2 * Phi(-|z|)（用 sf 计算，避免 1-Phi 的相消误差）
+
+    小样本（n<=8）已由精确置换覆盖，所以这里不需要再做连续性/小样本修正：修正的
+    必要性只存在于「小 n 却用渐近」的场景，而那种场景在本实现里不会发生。n>8 时
+    scipy 在无并列且 n<=33 时默认仍走精确置换（尤其 |tau|→1 的尾部，精确 p 会比
+    渐近 p 更小）；本函数面向「只拿得到 (tau, n)」的调用方，无法枚举/无法判断并列，
+    因此明确采用标准渐近口径。需要更精确时请改用向量接口
+    `_corr_pvalue(x, y, "kendall")`（内部走 scipy 的 exact/asymptotic 自动选择）。
+    """
+    try:
+        z_value = 3.0 * float(tau) * math.sqrt(float(n) * (n - 1.0)) / math.sqrt(2.0 * (2.0 * n + 5.0))
+        p_value = float(2.0 * sps.norm.sf(abs(z_value)))
+    except Exception:  # noqa: BLE001 - 退化输入不给显著性
+        return 1.0
+    if not math.isfinite(p_value):
+        return 1.0
+    return max(0.0, min(1.0, p_value))
+
+
+def _kendall_pvalue_from_statistic(tau: float, n: float) -> float:
+    """只有 (tau, n)、没有原始观测时的 Kendall 双侧 P：小 n 精确、大 n 渐近。
+
+    旧实现把所有相关方法都套 Pearson 的 t 近似：
+        t = r*sqrt((n-2)/(1-r^2))
+    tau=1 时分母为 0 → nan；tau 接近 1 时也被严重低估。Kendall 的零分布与
+    Pearson 完全不同，必须按秩置换/渐近正态口径计算。本函数保证返回有限值
+    （不返回 nan）：样本量不足以定义零分布时按最保守的 p=1 处理。
+    """
+    try:
+        tau_value = float(tau)
+        n_value = float(n)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(tau_value) or not math.isfinite(n_value) or n_value < 3.0:
+        return 1.0  # n<3 时 tau 不携带任何可检验信息：保守地给 p=1，而不是 nan
+    n_int = int(round(n_value))
+    exact = _kendall_exact_pvalue(tau_value, n_int)
+    if exact is not None:
+        return max(0.0, min(1.0, float(exact)))
+    return _kendall_asymptotic_pvalue(tau_value, n_int)
+
+
+def _legacy_statistic_pvalue(statistic: float, n: float) -> float:
+    """只有 (统计量, n) 时 Pearson/Spearman 沿用的 t 近似（保持既有行为不变）。"""
+    if not math.isfinite(statistic) or not math.isfinite(n) or n < 3:
+        return float("nan")
+    if abs(statistic) >= 1.0:
+        return 0.0
+    try:
+        t_value = abs(statistic) * math.sqrt((n - 2.0) / max(1e-300, 1.0 - statistic * statistic))
+        return float(2.0 * sps.t.sf(t_value, n - 2.0))
+    except Exception:  # noqa: BLE001
+        return float("nan")
+
+
+def _corr_pvalue(x: Any, y: Any = None, method: str = "pearson") -> float:
+    """按方法分派真实零分布，支持两种调用形态（向后兼容）。
+
+    1) 观测向量：_corr_pvalue(x_array, y_array, method)
+       corr 热图走这条：Pearson=t 近似；Spearman=小样本精确置换/AS89；
+       Kendall=scipy.stats.kendalltau（并列时自带并列校正）。
+    2) 统计量：_corr_pvalue(statistic, n, method="kendall")
+       只有统计量、没有原始数据时走这条（外部校验/报告/取证回查）。
+       Kendall 用「小 n 精确置换、大 n 正态渐近」算 P（见上），tau=±1 也返回有限值。
+       若两个入参都是标量（0 维或长度 1），按 (statistic, n) 解释。
+    Pearson/Spearman 的既有行为不变。
+    """
+    left = np.asarray(x, dtype=float).ravel()
+    right = np.asarray([] if y is None else y, dtype=float).ravel()
+    name = str(method or "pearson").lower()
+    if left.size == 1 and right.size == 1:
+        statistic = float(left[0])
+        size = float(right[0])
+        if name == "kendall":
+            return _kendall_pvalue_from_statistic(statistic, size)
+        return _legacy_statistic_pvalue(statistic, size)
     mask = np.isfinite(left) & np.isfinite(right)
     a, b = left[mask], right[mask]
     if a.size < 3:
         return float("nan")
     try:
-        name = str(method or "pearson").lower()
         if name == "kendall":
             return float(sps.kendalltau(a, b).pvalue)
         if name == "spearman":
