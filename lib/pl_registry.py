@@ -538,6 +538,173 @@ def _dataset_groups(dataset: Mapping[str, Any]) -> list[str] | None:
 
 
 # ---------------------------------------------------------------------------
+# 统计口径（口径卡）数据源：只搬运真实状态字段，取不到给 None，不猜
+# ---------------------------------------------------------------------------
+
+def now_iso() -> str:
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _column_kind_counts(dataset: Mapping[str, Any]) -> dict:
+    """列类型计数：numeric/categorical/time 来自列摘要 dtype；event 只认显式角色映射。
+
+    event 不是 dtype，没有角色映射时写 None（取不到），不写 0 冒充「没有事件列」。
+    """
+    counts = {"numeric": 0, "categorical": 0, "time": 0, "other": 0, "event": None}
+    for column in dataset.get("columns") or []:
+        dtype = str(column.get("dtype") or "")
+        if dtype == "numeric":
+            counts["numeric"] += 1
+        elif dtype == "datetime":
+            counts["time"] += 1
+        elif dtype in ("category", "text"):
+            counts["categorical"] += 1
+        else:
+            counts["other"] += 1
+    # 事件列不是 dtype：只认用户/角色推断显式映射的 event 列（不按列名猜）
+    roles = dataset.get("roles") or {}
+    if roles.get("event"):
+        counts["event"] = 1
+    return counts
+
+
+def _missing_summary(dataset: Mapping[str, Any]) -> dict:
+    """缺失率：优先用列摘要里的 missing（O(列数)），列摘要缺失时才扫 DataFrame。"""
+    df = dataset.get("df")
+    n_rows = int(df.shape[0]) if df is not None else None
+    n_cols = int(df.shape[1]) if df is not None else None
+    columns = list(dataset.get("columns") or [])
+    missing_cells: int | None = None
+    columns_with_missing: int | None = None
+    if columns:
+        missing_cells = int(sum(int(column.get("missing") or 0) for column in columns))
+        columns_with_missing = int(sum(1 for column in columns if int(column.get("missing") or 0) > 0))
+    elif df is not None:
+        missing_cells = int(df.isna().sum().sum())
+        columns_with_missing = int(df.isna().any().sum())
+    cells = (n_rows * n_cols) if (n_rows is not None and n_cols is not None) else None
+    rate = (missing_cells / cells) if (missing_cells is not None and cells) else None
+    return {
+        "cells": cells,
+        "missing": missing_cells,
+        "columns_with_missing": columns_with_missing,
+        "rate": round(rate, 6) if rate is not None else None,
+    }
+
+
+def _clean_summary(dataset: Mapping[str, Any]) -> dict:
+    """清洗记录与行数变化：raw_df 是导入快照，逐条 rows_before/rows_after 是清洗留痕。"""
+    cleaning = list(dataset.get("cleaning") or [])
+    df = dataset.get("df")
+    raw = dataset.get("raw_df")
+    rows_current = int(df.shape[0]) if df is not None else None
+    rows_import = int(raw.shape[0]) if raw is not None else None
+    cols_current = int(df.shape[1]) if df is not None else None
+    cols_import = int(raw.shape[1]) if raw is not None else None
+    deltas: list[int] = []
+    complete = True
+    for step in cleaning:
+        before, after = step.get("rows_before"), step.get("rows_after")
+        if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+            deltas.append(int(after) - int(before))
+        else:
+            complete = False
+    if not cleaning:
+        logged_delta: int | None = 0
+    else:
+        logged_delta = sum(deltas) if complete else None
+    changed_rows: bool | None = None
+    trace_complete: bool | None = None
+    if rows_import is not None and rows_current is not None:
+        changed_rows = rows_import != rows_current
+        if logged_delta is not None:
+            trace_complete = logged_delta == (rows_current - rows_import)
+    return {
+        "steps": len(cleaning),
+        "ops": [str(step.get("op") or "") for step in cleaning],
+        "rows_import": rows_import,
+        "rows_current": rows_current,
+        "rows_delta": (rows_current - rows_import) if (rows_import is not None and rows_current is not None) else None,
+        "columns_import": cols_import,
+        "columns_current": cols_current,
+        "logged_rows_delta": logged_delta,
+        "changed_rows": changed_rows,
+        "trace_complete": trace_complete,
+    }
+
+
+def _group_counts(dataset: Mapping[str, Any]) -> dict:
+    """每个分组水平的行/样本数（判断「每组 n<2」的依据）；无分组返回空 dict。"""
+    group_col = str(dataset.get("group_col") or (dataset.get("roles") or {}).get("group") or "")
+    df = dataset.get("df")
+    series = None
+    if df is not None and group_col and group_col in df.columns:
+        series = df[group_col]
+    else:
+        info = dataset.get("sample_info")
+        if isinstance(info, pd.DataFrame) and not info.empty:
+            column = group_col if group_col in info.columns else ("group" if "group" in info.columns else "")
+            if column:
+                series = info[column]
+    if series is None:
+        return {}
+    counts: dict[str, int] = {}
+    for value, count in series.astype(str).value_counts().items():
+        if value in ("nan", "None", ""):
+            continue
+        counts[str(value)] = int(count)
+    return counts
+
+
+def _style_overrides(style: Mapping[str, Any] | None) -> list[str]:
+    """图上样式相对默认值覆盖了哪些键（run.style 已由 resolve_style 补全，直接对比）。"""
+    merged = dict(style or {})
+    overrides: list[str] = []
+    for key, default in C.STYLE_DEFAULT.items():
+        if merged.get(key) != default:
+            overrides.append(str(key))
+    return sorted(overrides)
+
+
+def _inference_kind(stats: Mapping[str, Any] | None) -> str | None:
+    """从 figure run 的 stats 载荷判断推断类型（只按真实存在的键分类）。"""
+    if not isinstance(stats, Mapping) or not stats:
+        return None
+    if stats.get("pairs") or stats.get("contrasts") or stats.get("global"):
+        return "group_comparison"
+    if stats.get("correlation") is not None:
+        return "correlation"
+    if "logrank_p" in stats:
+        return "survival"
+    if stats.get("fit") is not None:
+        return "regression"
+    if stats.get("describe") or stats.get("dist"):
+        return "descriptive"
+    return None
+
+
+_STAT_CONTRACT_PARAM_KEYS = (
+    "method", "adjust", "alpha", "paired", "pairing", "independent_samples",
+    "label", "score", "positive", "time", "event", "group", "covariates",
+    "columns", "x", "y",
+)
+
+
+def _stat_params_for_contract(params: Mapping[str, Any] | None) -> dict:
+    """最近一次统计真正用到的参数子集（校正方法/alpha/配对/独立样本声明等）。"""
+    out: dict[str, Any] = {}
+    for key in _STAT_CONTRACT_PARAM_KEYS:
+        value = (params or {}).get(key)
+        if value is None or value == "" or value == [] or value == {}:
+            continue
+        if isinstance(value, (list, tuple)):
+            out[key] = C.jsonable(list(value)[:10])
+        elif isinstance(value, (str, int, float, bool)):
+            out[key] = value
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 出图 run：figure_run_id 固化的图版本（源数据 digest + 参数 + 样式 + 角色 + 图层 + 统计表）
 # ---------------------------------------------------------------------------
 
@@ -687,9 +854,94 @@ class WorkerState:
             raise C.prerequisite("还没有打开数据集：请先拖入数据或载入示例（action=open/demo）")
         return self.datasets[key]
 
-    def dataset_summary(self, dataset: Mapping[str, Any], with_columns: bool = True) -> dict:
+    def _last_figure_summary(self, dataset: Mapping[str, Any]) -> dict | None:
+        """最近一次真正用过的 figure run（按数据集 history 的最后一条回查 registry）。
+
+        口径卡要回答「这张图是怎么来的」，所以优先 history 的最后一条——它记录的是
+        「最近一次真正渲染/复用」而不是「最近一次新建」。记录被清理时给
+        artifact_available=False，让 UI/Agent 知道只剩历史条目，不假装完整。
+        """
+        history = list(dataset.get("history") or [])
+        entry: Mapping[str, Any] | None = None
+        run: Mapping[str, Any] | None = None
+        for candidate in reversed(history):
+            run_id = str(candidate.get("figure_run_id") or "")
+            if not run_id:
+                continue
+            entry = candidate
+            run = self.figure_runs.get(run_id)
+            break
+        if run is None and entry is None:
+            for candidate in reversed(list(self.figure_runs.values())):
+                if candidate.get("dataset_id") == dataset.get("id"):
+                    run = candidate
+                    break
+        if run is None and entry is None:
+            return None
+        if run is None:
+            # 只剩 history 条目（run 已被 MAX_FIGURE_RUNS 挤掉/进程重启）：字段能写多少写多少
+            record = dict(entry or {})
+            return {
+                "figure_run_id": str(record.get("figure_run_id") or "") or None,
+                "chart": record.get("chart"),
+                "chart_title": record.get("chart_title"),
+                "at": record.get("at"),
+                "data_digest": record.get("data_digest"),
+                "roles": {},
+                "params": {},
+                "style_overrides": [],
+                "inference": None,
+                "n_figures": None,
+                "artifact_available": False,
+            }
+        stats = run.get("stats") if isinstance(run.get("stats"), Mapping) else {}
+        layers = [layer for layer in (run.get("layers") or []) if isinstance(layer, Mapping)]
+        inference_layer = next((layer for layer in layers if layer.get("id") == "inference"), {})
+        method = inference_layer.get("method") if inference_layer else None
+        p_adjust = inference_layer.get("p_adjust") if inference_layer else None
+        factor = inference_layer.get("factor") if inference_layer else None
+        n_contrasts = inference_layer.get("contrasts") if inference_layer else None
+        pairs = stats.get("pairs") or stats.get("contrasts") or []
+        if not isinstance(n_contrasts, int):
+            n_contrasts = len(pairs) if pairs else None
+        n_per_group = stats.get("n") if isinstance(stats.get("n"), Mapping) else None
+        if n_per_group:
+            n_per_group = {
+                str(name): int(count) for name, count in n_per_group.items()
+                if isinstance(count, (int, float))
+            }
+        has_inference = bool(stats) or bool(method) or bool(p_adjust)
+        inference = None
+        if has_inference:
+            inference = {
+                "method": method or stats.get("method"),
+                "p_adjust": p_adjust or stats.get("p_adjust"),
+                # 图上星号阈值是固定的 0.001/0.01/0.05，引擎不记录可调 α → 不编默认值
+                "alpha": None,
+                "factor": factor or stats.get("factor"),
+                "n_contrasts": n_contrasts,
+                "n_per_group": n_per_group or None,
+                "kind": _inference_kind(stats),
+            }
+        return {
+            "figure_run_id": str(run.get("figure_run_id") or "") or None,
+            "chart": run.get("chart"),
+            "chart_title": run.get("chart_title"),
+            "at": run.get("at"),
+            "data_digest": run.get("data_digest"),
+            "roles": {k: v for k, v in (run.get("roles") or {}).items() if v},
+            "params": C.jsonable(dict(run.get("params") or {})),
+            "style_overrides": _style_overrides(run.get("style") or {}),
+            "inference": inference,
+            "n_figures": len(run.get("figures") or []),
+            "artifact_available": True,
+        }
+
+    def dataset_summary(self, dataset: Mapping[str, Any], with_columns: bool = True,
+                        with_digest: bool = False) -> dict:
         df = dataset.get("df")
         n_rows, n_cols = (int(df.shape[0]), int(df.shape[1])) if df is not None else (0, 0)
+        roles = {k: v for k, v in (dataset.get("roles") or {}).items() if v}
         payload = {
             "id": dataset.get("id"),
             "name": dataset.get("name"),
@@ -697,7 +949,7 @@ class WorkerState:
             "source": dataset.get("source"),
             "n_rows": n_rows,
             "n_cols": n_cols,
-            "roles": {k: v for k, v in (dataset.get("roles") or {}).items() if v},
+            "roles": roles,
             "group_col": dataset.get("group_col"),
             "groups": _dataset_groups(dataset),
             "cleaning": [
@@ -705,6 +957,16 @@ class WorkerState:
                  "rows_before": item.get("rows_before"), "rows_after": item.get("rows_after")}
                 for item in dataset.get("cleaning") or []
             ],
+            # 统计口径卡的数据源：列类型/缺失/清洗行数/每组 n/最近图·统计·导出
+            "column_kinds": _column_kind_counts(dataset),
+            "missing": _missing_summary(dataset),
+            "clean_summary": _clean_summary(dataset),
+            "group_counts": _group_counts(dataset),
+            "time_col": roles.get("time"),
+            "event_col": roles.get("event"),
+            "last_figure": self._last_figure_summary(dataset),
+            "last_stat": C.jsonable(dataset.get("last_stat") or None),
+            "last_export": C.jsonable(dataset.get("last_export") or None),
             "need": dataset.get("need") or "",
             "history_count": len(dataset.get("history") or []),
             "notes": dataset.get("notes") or [],
@@ -718,6 +980,10 @@ class WorkerState:
             payload["columns"] = C.jsonable(dataset.get("columns") or [])
             payload["numeric_cols"] = P.numeric_columns(dataset)
             payload["categorical_cols"] = P.categorical_columns(dataset)
+        if with_digest:
+            # 当前数据指纹：口径卡用它判断「最近一次图是不是在当前数据版本上画的」。
+            # 只在 status/records 里算（全量哈希有成本），其他操作回传的 summary 不带。
+            payload["data_digest"] = data_digest(dataset)
         return payload
 
     def _register_figures(self, figures: Sequence[Mapping[str, Any]] | None) -> list[dict]:
@@ -830,9 +1096,10 @@ class WorkerState:
         }
 
     def op_state(self, args: Mapping[str, Any]) -> dict:
-        active = self.datasets.get(self.active) if self.active else None
         return {
-            "datasets": [self.dataset_summary(ds, with_columns=False) for ds in self.datasets.values()],
+            # status 是口径卡的主入口：带 data_digest 才能判断「图是否在当前数据版本上」
+            "datasets": [self.dataset_summary(ds, with_columns=False, with_digest=True)
+                         for ds in self.datasets.values()],
             "active": self.active,
             "engine": {"python": _python_exe(), "mode": "builtin", "workdir": self.workdir},
             "started_at": self.started_at,
@@ -1235,12 +1502,36 @@ class WorkerState:
                 roles[key] = value
         data = P.build_data(dataset, stat_meta, params, roles)
         started = time.perf_counter()
-        result = _stats().run(stat_id, dataset, data, params, style, self.dirs["figures"])
+        stat_record = {
+            "stat": stat_id,
+            "title": stat_id,
+            "method": "",
+            "params": C.jsonable(_stat_params_for_contract(params)),
+            "alpha": params.get("alpha") if isinstance(params.get("alpha"), (int, float)) else None,
+            # 组间比较/多重校正的默认校正方法来自 style.p_adjust（引擎真实生效值）；
+            # 其他统计没有多重校正，不记录，避免把不适用的方法写进口径。
+            "p_adjust": (params.get("adjust") if isinstance(params.get("adjust"), str) else None)
+            or (style.get("p_adjust") if stat_id in ("compare", "adjust") else None),
+            "at": now_iso(),
+        }
+        try:
+            result = _stats().run(stat_id, dataset, data, params, style, self.dirs["figures"])
+        except C.EngineError as error:
+            # 失败也要留痕：口径卡据此提示「最近一次统计失败，结论不可用」
+            dataset["last_stat"] = {**stat_record, "ok": False, "error": str(error.message)}
+            raise
         figures = self._register_figures(result.get("figures"))
         result["figures"] = figures
         result["stat"] = stat_id
         result["dataset"] = self.dataset_summary(dataset, with_columns=False)
         result["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
+        dataset["last_stat"] = {
+            **stat_record,
+            "title": str(result.get("title") or stat_id),
+            "method": str(result.get("method") or ""),
+            "ok": True,
+            "error": None,
+        }
         dataset.setdefault("steps", []).append(f"stat:{stat_id}")
         return result
 
@@ -1444,14 +1735,32 @@ class WorkerState:
         exported.setdefault("chart", chart_id)
         if stats_result is not None:
             exported["stats"] = stats_result
+        # 口径卡的导出绑定：记录最近一次成功导出的 binding.status / figure_run_id / diffs，
+        # 让「导出的图」与「当前预览的图」是否同一张可被回查（而不是靠最近一次导出猜）。
+        binding = exported.get("figure_binding") if isinstance(exported.get("figure_binding"), Mapping) else {}
+        dataset["last_export"] = {
+            "what": str(exported.get("what") or args.get("what") or "bundle"),
+            "file": exported.get("file"),
+            "at": now_iso(),
+            "status": binding.get("status"),
+            "verified": binding.get("verified"),
+            "chart": exported.get("chart") or binding.get("chart") or chart_id or None,
+            "figure_run_id": exported.get("figure_run_id") or None,
+            "data_digest": exported.get("data_digest") or None,
+            "diffs": list(binding.get("diffs") or []),
+            "notes": list(binding.get("notes") or []),
+            "n_files": len(exported.get("files") or []),
+        }
         return exported
 
     def op_records(self, args: Mapping[str, Any]) -> dict:
         dataset = self.get(args.get("dataset"))
+        summary = self.dataset_summary(dataset, with_columns=False, with_digest=True)
         requested = str(args.get("figure_run_id") or "").strip()
         if requested:
             run = self.get_figure_run(requested)
-            return {"figure_run": self._figure_run_view(run), "figure_run_id": requested}
+            return {"figure_run": self._figure_run_view(run), "figure_run_id": requested,
+                    "dataset": summary}
         runs = [
             {"figure_run_id": run.get("figure_run_id"), "chart": run.get("chart"),
              "chart_title": run.get("chart_title"), "data_digest": run.get("data_digest"),
@@ -1461,7 +1770,7 @@ class WorkerState:
         ]
         return {"history": self._history_view(dataset), "count": len(dataset.get("history") or []),
                 "figure_runs": runs, "figure_runs_count": len(runs),
-                "need": dataset.get("need") or ""}
+                "need": dataset.get("need") or "", "dataset": summary}
 
     # 自检 / 建议
     def op_audit(self, args: Mapping[str, Any]) -> dict:

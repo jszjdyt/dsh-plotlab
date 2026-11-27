@@ -54,5 +54,16 @@
   ],
   "engines": {
     "node": ">=18"
+  },
+  "ci": {
+    "node": [
+      "test/test_stats_contract.mjs"
+    ],
+    "python": [
+      "test/test_p0_biological_n_cleaning.py",
+      "test/test_p0_export_binding.py",
+      "test/test_p0_kendall_export_binding.py",
+      "test/test_p0_stats_significance.py"
+    ]
   }
 }

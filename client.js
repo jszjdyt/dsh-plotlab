@@ -425,6 +425,312 @@
     return String(figure.id || '') + ':' + String(figure.file || '')
   }
 
+  // --------------------------------------------------------------------------
+  // 统计口径（口径卡）：契约归一化 + 数据集透传 + 中英词典
+  //
+  // 口径契约由 Host 的 lib/stats_contract.mjs 生成，挂在 status/records 的
+  // dataset.stats_contract（顶层也有一份）。这里只做「缺失一律 null」的 UI 归一化，
+  // 不补默认值；normalizeDataset 负责把契约原样透传给页面状态。
+  // --------------------------------------------------------------------------
+
+  function asNumber(value) {
+    if (isNil(value) || value === '') return null
+    var number = Number(value)
+    return isFinite(number) ? number : null
+  }
+
+  /** 去掉空白、把 undefined 变空串；可选截断。 */
+  function plainText(value, max) {
+    var text = isNil(value) ? '' : String(value).replace(/\s+/g, ' ').trim()
+    if (isFinite(Number(max)) && Number(max) > 0 && text.length > Number(max)) {
+      return text.slice(0, Number(max) - 1) + '…'
+    }
+    return text
+  }
+
+  function normalizeCountMap(payload) {
+    var raw = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {}
+    var out = {}
+    Object.keys(raw).forEach(function (key) {
+      var name = plainText(key)
+      if (!name) return
+      out[name] = asNumber(raw[key])
+    })
+    return out
+  }
+
+  function normalizePlainObject(payload) {
+    return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {}
+  }
+
+  /** 口径契约 → UI 模型（缺失一律 null，不编默认值）。 */
+  function normalizeStatsContract(payload) {
+    var raw = payload && typeof payload === 'object' ? payload : null
+    if (!raw) return null
+    var dataset = normalizePlainObject(raw.dataset)
+    var columnKinds = normalizePlainObject(dataset.columns)
+    var missing = normalizePlainObject(dataset.missing)
+    var cleaning = normalizePlainObject(dataset.cleaning)
+    var groups = normalizePlainObject(dataset.groups)
+    var declared = normalizePlainObject(dataset.declared)
+    var figureRaw = raw.figure && typeof raw.figure === 'object' ? raw.figure : null
+    var statRaw = raw.stat && typeof raw.stat === 'object' ? raw.stat : null
+    var exportRaw = raw.export && typeof raw.export === 'object' ? raw.export : null
+    var figure = null
+    if (figureRaw) {
+      var inferenceRaw = figureRaw.inference && typeof figureRaw.inference === 'object' ? figureRaw.inference : null
+      var rolesRaw = normalizePlainObject(figureRaw.roles)
+      var roles = {}
+      ;['x', 'y', 'group', 'color', 'size', 'facet', 'time', 'event'].forEach(function (key) {
+        roles[key] = plainText(rolesRaw[key] || '')
+      })
+      figure = {
+        figureRunId: plainText(figureRaw.figure_run_id || ''),
+        chart: plainText(figureRaw.chart || ''),
+        chartTitle: plainText(figureRaw.chart_title || ''),
+        at: plainText(figureRaw.at || ''),
+        dataDigest: plainText(figureRaw.data_digest || ''),
+        dataMatchesCurrent: figureRaw.data_matches_current === true ? true
+          : (figureRaw.data_matches_current === false ? false : null),
+        roles: roles,
+        params: normalizePlainObject(figureRaw.params),
+        styleOverrides: Array.isArray(figureRaw.style_overrides)
+          ? figureRaw.style_overrides.map(function (item) { return plainText(item) }).filter(Boolean) : [],
+        inference: inferenceRaw ? {
+          method: plainText(inferenceRaw.method || ''),
+          pAdjust: plainText(inferenceRaw.p_adjust || ''),
+          alpha: asNumber(inferenceRaw.alpha),
+          factor: plainText(inferenceRaw.factor || ''),
+          kind: plainText(inferenceRaw.kind || ''),
+          nContrasts: asNumber(inferenceRaw.n_contrasts),
+          nPerGroup: normalizeCountMap(inferenceRaw.n_per_group),
+        } : null,
+        nFigures: asNumber(figureRaw.n_figures),
+        artifactAvailable: figureRaw.artifact_available === false ? false
+          : (figureRaw.artifact_available === true ? true : null),
+      }
+    }
+    return {
+      schema: plainText(raw.schema || ''),
+      plugin: plainText(raw.plugin || ''),
+      pluginVersion: plainText(raw.plugin_version || ''),
+      okToCite: raw.ok_to_cite === true,
+      dataset: {
+        id: plainText(dataset.id || ''),
+        name: plainText(dataset.name || ''),
+        kind: plainText(dataset.kind || ''),
+        source: plainText(dataset.source || ''),
+        nRows: asNumber(dataset.n_rows),
+        nCols: asNumber(dataset.n_cols),
+        columnKinds: {
+          numeric: asNumber(columnKinds.numeric),
+          categorical: asNumber(columnKinds.categorical),
+          time: asNumber(columnKinds.time),
+          event: asNumber(columnKinds.event),
+          other: asNumber(columnKinds.other),
+          total: asNumber(columnKinds.total),
+        },
+        declared: {
+          timeColumn: plainText(declared.time_column || ''),
+          eventColumn: plainText(declared.event_column || ''),
+        },
+        missing: {
+          cells: asNumber(missing.cells),
+          missing: asNumber(missing.missing),
+          columnsWithMissing: asNumber(missing.columns_with_missing),
+          rate: asNumber(missing.rate),
+        },
+        cleaning: {
+          steps: asNumber(cleaning.steps),
+          ops: Array.isArray(cleaning.ops) ? cleaning.ops.map(function (item) { return plainText(item) }).filter(Boolean) : [],
+          rowsImport: asNumber(cleaning.rows_import),
+          rowsCurrent: asNumber(cleaning.rows_current),
+          rowsDelta: asNumber(cleaning.rows_delta),
+          loggedRowsDelta: asNumber(cleaning.logged_rows_delta),
+          changedRows: cleaning.changed_rows === true ? true : (cleaning.changed_rows === false ? false : null),
+          traceComplete: cleaning.trace_complete === true ? true : (cleaning.trace_complete === false ? false : null),
+        },
+        groups: {
+          key: plainText(groups.key || ''),
+          levels: Array.isArray(groups.levels) ? groups.levels.map(function (item) { return plainText(item) }).filter(Boolean) : [],
+          counts: normalizeCountMap(groups.counts),
+        },
+        dataDigest: plainText(dataset.data_digest || ''),
+        createdAt: plainText(dataset.created_at || ''),
+      },
+      figure: figure,
+      stat: statRaw ? {
+        stat: plainText(statRaw.stat || ''),
+        title: plainText(statRaw.title || ''),
+        method: plainText(statRaw.method || ''),
+        pAdjust: plainText(statRaw.p_adjust || ''),
+        alpha: asNumber(statRaw.alpha),
+        params: normalizePlainObject(statRaw.params),
+        at: plainText(statRaw.at || ''),
+        ok: statRaw.ok === false ? false : (statRaw.ok === true ? true : null),
+        error: plainText(statRaw.error || ''),
+      } : null,
+      exportInfo: exportRaw ? {
+        what: plainText(exportRaw.what || ''),
+        file: plainText(exportRaw.file || ''),
+        at: plainText(exportRaw.at || ''),
+        status: plainText(exportRaw.status || ''),
+        verified: exportRaw.verified === true ? true : (exportRaw.verified === false ? false : null),
+        chart: plainText(exportRaw.chart || ''),
+        figureRunId: plainText(exportRaw.figure_run_id || ''),
+        dataMatchesCurrentFigure: exportRaw.data_matches_current_figure === true ? true
+          : (exportRaw.data_matches_current_figure === false ? false : null),
+        diffs: Array.isArray(exportRaw.diffs) ? exportRaw.diffs.map(function (item) { return plainText(item) }).filter(Boolean) : [],
+        nFiles: asNumber(exportRaw.n_files),
+      } : null,
+      caveats: Array.isArray(raw.caveats) ? raw.caveats.map(function (item) {
+        var entry = item && typeof item === 'object' ? item : {}
+        return { code: plainText(entry.code || ''), level: plainText(entry.level || 'info'), text: plainText(entry.text || '') }
+      }).filter(function (item) { return Boolean(item.text) }) : [],
+    }
+  }
+
+  /** 数据集 summary 归一化：保留原始字段，只把 UI 用到的字段规整，并把 stats_contract 透传。 */
+  function normalizeDataset(payload) {
+    var raw = payload && typeof payload === 'object'
+      ? (payload.dataset && typeof payload.dataset === 'object' ? payload.dataset : payload)
+      : {}
+    var out = Object.assign({}, raw)
+    out.id = plainText(raw.id || '')
+    out.name = plainText(raw.name || out.id || '')
+    out.kind = plainText(raw.kind || '')
+    out.source = plainText(raw.source || '')
+    out.n_rows = asNumber(raw.n_rows)
+    out.n_cols = asNumber(raw.n_cols)
+    out.group_col = plainText(raw.group_col || '')
+    out.groups = Array.isArray(raw.groups)
+      ? raw.groups.map(function (item) { return plainText(item) }).filter(Boolean) : []
+    out.roles = normalizePlainObject(raw.roles)
+    out.cleaning = Array.isArray(raw.cleaning) ? raw.cleaning : []
+    out.notes = Array.isArray(raw.notes) ? raw.notes : []
+    out.warnings = Array.isArray(raw.warnings) ? raw.warnings : []
+    // columns 只有真的带了才覆盖：plot/stat 回传的 summary 故意不带列摘要，
+    // 覆盖成 [] 会把页面上的列清单（来自 preview）清空。
+    if (Array.isArray(raw.columns)) out.columns = raw.columns
+    else delete out.columns
+    out.need = plainText(raw.need || '')
+    out.history_count = asNumber(raw.history_count)
+    out.data_digest = plainText(raw.data_digest || '')
+    out.stats_contract = normalizeStatsContract(raw.stats_contract)
+    return out
+  }
+
+  // 文案字典（zh 完整；en 与 zh 同 key 集）。apply() 里 locale.register 注册。
+  var DICT_ZH = {
+    nav: '绘图',
+    title: 'PlotLab 绘图工作台',
+    contractTitle: '统计口径',
+    contractHint: '口径 = 数据集现状 + 最近一次 figure run 的检验/校正 + 导出绑定；随记录页刷新，导出 protocol 同源。',
+    contractOk: '可引用',
+    contractWarn: '待注意',
+    contractNoData: '还没有数据集：导入后才有统计口径。',
+    contractLoading: '口径读取中…（记录页数据还没回来）',
+    contractDataset: '数据',
+    contractRows: '行列',
+    contractColumnKinds: '列类型',
+    contractMissing: '缺失',
+    contractCleaning: '清洗',
+    contractGroups: '分组',
+    contractFigure: '最近图',
+    contractInference: '图内检验',
+    contractRoles: '角色映射',
+    contractStyle: '样式覆盖',
+    contractStat: '最近统计',
+    contractExport: '导出绑定',
+    contractCaveats: '引用前必须处理',
+    contractInfo: '其它提示',
+    contractNoFigure: '还没有 figure run',
+    contractNoStat: '还没有统计记录',
+    contractNoExport: '还没有导出记录',
+    contractNoInference: '图上没有统计检验',
+    contractNoGroups: '未设分组',
+    contractMissingNone: '无缺失',
+    contractStyleDefault: '全部默认样式',
+    contractMethod: '方法',
+    contractAdjust: '校正',
+    contractAlpha: 'α',
+    contractNotRecorded: '未记录',
+    contractRunId: 'run',
+    contractExportMatch: '与当前图一致',
+    contractExportMismatch: '与当前图不一致',
+    contractStatusReused: '一致复用',
+    contractStatusRerendered: '已按请求重画',
+    contractStatusRendered: '现场出图',
+    contractStatusLegacy: '旧记录',
+    contractStatusAbsent: '不含图',
+    contractSourceDemo: '内置示例',
+  }
+  var DICT_EN = {
+    nav: 'PlotLab',
+    title: 'PlotLab workbench',
+    contractTitle: 'Statistical contract',
+    contractHint: 'Contract = dataset state + test/correction of the latest figure run + export binding; refreshes with records and matches the exported protocol.',
+    contractOk: 'Citable',
+    contractWarn: 'Needs attention',
+    contractNoData: 'No dataset yet: a contract appears after import.',
+    contractLoading: 'Loading contract… (records are not back yet)',
+    contractDataset: 'Data',
+    contractRows: 'Shape',
+    contractColumnKinds: 'Column types',
+    contractMissing: 'Missing',
+    contractCleaning: 'Cleaning',
+    contractGroups: 'Groups',
+    contractFigure: 'Latest figure',
+    contractInference: 'Figure inference',
+    contractRoles: 'Role mapping',
+    contractStyle: 'Style overrides',
+    contractStat: 'Latest statistic',
+    contractExport: 'Export binding',
+    contractCaveats: 'Fix before citing',
+    contractInfo: 'Notes',
+    contractNoFigure: 'No figure run yet',
+    contractNoStat: 'No statistic yet',
+    contractNoExport: 'No export yet',
+    contractNoInference: 'No statistical test on the figure',
+    contractNoGroups: 'No group column',
+    contractMissingNone: 'No missing cells',
+    contractStyleDefault: 'All defaults',
+    contractMethod: 'Method',
+    contractAdjust: 'Adjustment',
+    contractAlpha: 'α',
+    contractNotRecorded: 'not recorded',
+    contractRunId: 'run',
+    contractExportMatch: 'Same as current figure',
+    contractExportMismatch: 'Different from current figure',
+    contractStatusReused: 'Reused (consistent)',
+    contractStatusRerendered: 'Re-rendered on request',
+    contractStatusRendered: 'Rendered on request',
+    contractStatusLegacy: 'Legacy record',
+    contractStatusAbsent: 'No figure',
+    contractSourceDemo: 'Built-in demo',
+  }
+
+  /**
+   * 宿主 locale 服务 → 取词函数。宿主不可用时静默回落 DICT_ZH，
+   * 保证任何环境（含单测）下 T() 都不会返回裸 key 或抛异常。
+   */
+  function createTranslator(locale) {
+    var bound = null
+    try {
+      if (locale && typeof locale.bind === 'function') bound = locale.bind(NS)
+    } catch (error) { bound = null }
+    return function translate(key) {
+      if (typeof bound === 'function') {
+        try {
+          var value = bound(key)
+          if (typeof value === 'string' && value && value !== key) return value
+        } catch (error) { /* 宿主 locale 不可用时静默回落 */ }
+      }
+      var fallback = DICT_ZH[key]
+      return typeof fallback === 'string' ? fallback : String(key)
+    }
+  }
+
   /** 简易 API 客户端：注入 fetch 便于单测。 */
   function createApi(fetchImpl, baseUrl) {
     var base = baseUrl || API
@@ -547,6 +853,13 @@
     createApi: createApi,
     clone: clone,
     classNames: classNames,
+    asNumber: asNumber,
+    plainText: plainText,
+    normalizeStatsContract: normalizeStatsContract,
+    normalizeDataset: normalizeDataset,
+    createTranslator: createTranslator,
+    DICT_ZH: DICT_ZH,
+    DICT_EN: DICT_EN,
   }
 
   // ==========================================================================
@@ -566,7 +879,8 @@
       return React.createElement.apply(React, [type, props].concat(children))
     }
 
-    var T = function (key) { return String(key) }
+    /** t()：apply() 里用宿主 locale 服务重新绑定；默认回落中文词典。 */
+    var T = createTranslator(null)
 
     function warn(message, error) {
       try { console.warn('[dsh-plotlab] ' + message, error || '') } catch (ignored) { /* ignore */ }
@@ -706,6 +1020,16 @@
       '.pl-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px}',
       '.pl-card-title{display:flex;align-items:center;gap:6px;font-size:11.5px;font-weight:650;color:var(--dsw-alias-label-secondary)}',
       '.pl-card-body{display:flex;flex-direction:column;gap:8px}',
+      /* 统计口径卡（记录页）：只读展示，不参与样式编辑 */
+      '.pl-contract{display:flex;flex-direction:column;gap:6px;padding:11px 12px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1)}',
+      '.pl-contract-hint{font-size:10.5px;color:var(--dsw-alias-label-tertiary);line-height:1.5}',
+      '.pl-contract-row{display:flex;gap:8px;font-size:11.5px;align-items:baseline}',
+      '.pl-contract-k{flex:0 0 72px;color:var(--dsw-alias-label-secondary)}',
+      '.pl-contract-v{flex:1 1 auto;min-width:0;color:var(--dsw-alias-label-primary);word-break:break-word}',
+      '.pl-contract-warn{margin-top:2px;padding:7px 9px;border-radius:8px;font-size:11px;line-height:1.5;background:var(--dsw-alias-bg-layer-2);border:1px solid color-mix(in srgb,var(--dsw-alias-state-warn-primary) 28%,var(--dsw-alias-border-l1))}',
+      '.pl-contract-warn-title{font-weight:650;margin-bottom:2px;color:var(--dsw-alias-state-warn-primary)}',
+      '.pl-contract-info{margin-top:2px;font-size:10.5px;line-height:1.5;color:var(--dsw-alias-label-tertiary)}',
+      '.pl-contract-info-item{margin-top:1px}',
       '.pl-grid2{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px}',
       '.pl-grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:6px 12px}',
       '@media (max-width:1400px){.pl-grid3{grid-template-columns:1fr 1fr}}',
@@ -955,6 +1279,7 @@
       var [openSections, setOpenSections] = useState(function () { return { font: true, color: true, canvas: false, axis: false, legend: false, stat: false } })
       var [audit, setAudit] = useState(null)
       var [panelMode, setPanelMode] = useState('plot')
+      var [records, setRecords] = useState(null)
 
       var fileInputRef = useRef(null)
       var plotSeq = useRef(0)
@@ -974,6 +1299,22 @@
         var message = caught && caught.message ? caught.message : String(caught)
         setError(message)
         setBusy('')
+      }
+
+      /** 记录页 / 口径卡数据源：最近 figure run、最近统计、最近导出绑定都在 records 里。 */
+      function loadRecords(datasetId) {
+        if (!datasetId) return Promise.resolve(null)
+        return api.records(datasetId).then(function (payload) {
+          var next = payload && typeof payload === 'object' ? payload : {}
+          var rawContract = next.stats_contract || (next.dataset && next.dataset.stats_contract) || null
+          next.stats_contract = normalizeStatsContract(rawContract)
+          if (next.dataset) next.dataset = normalizeDataset(next.dataset)
+          setRecords(next)
+          return next
+        }).catch(function () {
+          // 记录读取失败不影响主流程；口径卡退回「无数据」而不是编造
+          return null
+        })
       }
 
       // ---- 启动 ----
@@ -1008,8 +1349,8 @@
 
       // ---- 采纳一个数据集 ----
       function adoptDataset(result, defer) {
-        var next = result.dataset
-        if (!next) return
+        var next = normalizeDataset(result.dataset)
+        if (!next || !next.id) return
         setDataset(next)
         setProfile(null)
         setStatResult(null)
@@ -1024,6 +1365,7 @@
           loadPreview(next.id)
         }
         loadProfile(next.id)
+        loadRecords(next.id)
         pickInitialChart(next, result.preview, defer)
       }
 
@@ -1091,7 +1433,7 @@
           setSummary(result.summary || null)
           setWarnings(result.warnings || [])
           setCode(result.code || null)
-          if (result.dataset) setDataset(result.dataset)
+          if (result.dataset) setDataset(normalizeDataset(result.dataset))
           setHistory(function (previous) {
             var entry = {
               id: result.figure ? result.figure.id : String(Date.now()),
@@ -1107,6 +1449,8 @@
             next.push(entry)
             return next.slice(-20)
           })
+          // 每次成功出图后刷新记录页：口径卡里的 figure_run_id / 检验方法 / 样式覆盖随之更新
+          loadRecords(ds.id)
         }).catch(function (caught) {
           if (seq !== plotSeq.current) return
           setBusy('')
@@ -1155,10 +1499,11 @@
         api.clean(dataset.id, null, true).then(function (result) {
           setBusy('')
           setCleaning(result)
-          if (result.dataset) setDataset(result.dataset)
+          if (result.dataset) setDataset(normalizeDataset(result.dataset))
           notify('清洗完成：应用 ' + (result.applied || []).length + ' 步，现在 ' + result.n_rows + ' 行')
           loadProfile(dataset.id)
           loadPreview(dataset.id)
+          loadRecords(dataset.id)
           runPlot()
         }).catch(function (caught) { setBusy(''); fail(caught) })
       }
@@ -1169,10 +1514,11 @@
         api.resetData(dataset.id).then(function (result) {
           setBusy('')
           setCleaning(null)
-          if (result.dataset) setDataset(result.dataset)
+          if (result.dataset) setDataset(normalizeDataset(result.dataset))
           notify('已恢复导入时数据')
           loadProfile(dataset.id)
           loadPreview(dataset.id)
+          loadRecords(dataset.id)
           runPlot()
         }).catch(function (caught) { setBusy(''); fail(caught) })
       }
@@ -1193,7 +1539,7 @@
           setBusy('')
           setPlan(result.plan || null)
           setCleaning(result.cleaning || null)
-          if (result.dataset) setDataset(result.dataset)
+          if (result.dataset) setDataset(normalizeDataset(result.dataset))
           setFigure(result.figure || null)
           setPlotInfo(result)
           setSummary(result.summary || null)
@@ -1210,6 +1556,7 @@
           setTab('preview')
           loadProfile(dataset.id)
           loadPreview(dataset.id)
+          loadRecords(dataset.id)
         }).catch(function (caught) { setBusy(''); fail(caught) })
       }
 
@@ -1217,7 +1564,13 @@
         if (!dataset) return
         setStatBusy(true)
         api.stat({ dataset: dataset.id, stat: statId, params: statParams, style: style, roles: roles })
-          .then(function (result) { setStatBusy(false); setStatResult(result); setTab('stats') })
+          .then(function (result) {
+            setStatBusy(false)
+            setStatResult(result)
+            setTab('stats')
+            // 最近一次统计（方法/校正/α/成功失败）会进口径卡
+            loadRecords(dataset.id)
+          })
           .catch(function (caught) { setStatBusy(false); fail(caught) })
       }
 
@@ -1241,6 +1594,8 @@
               document.body.removeChild(link)
             } catch (error) { /* 下载失败无所谓，用户可看路径 */ }
           }
+          // 导出后刷新绑定状态：口径卡要显示 figure_run_id / 一致 or 重画（status）
+          loadRecords(dataset.id)
         }).catch(function (caught) { setBusy(''); fail(caught) })
       }
 
@@ -1325,7 +1680,7 @@
             api.reset().then(function () {
               setDataset(null); setPreview(null); setProfile(null); setFigure(null)
               setSummary(null); setHistory([]); setStatResult(null); setPlan(null); setCleaning(null)
-              setNeed(''); setError(''); notify('工作台已清空')
+              setRecords(null); setNeed(''); setError(''); notify('工作台已清空')
             }).catch(fail)
           },
         }),
@@ -1367,7 +1722,14 @@
           }),
           h(RightColumn, {
             dataset: dataset, figure: figure, plotInfo: plotInfo, summary: summary, warnings: warnings,
-            busy: busy, busyLabel: busyLabel, tab: tab, onTab: setTab, statsCatalog: statsCatalog,
+            busy: busy, busyLabel: busyLabel, tab: tab,
+            onTab: function (nextTab) {
+              setTab(nextTab)
+              // 打开「记录」页时再刷一次：口径卡显示的是当前真实状态，不靠旧缓存
+              if (nextTab === 'history' && dataset && dataset.id) loadRecords(dataset.id)
+            },
+            records: records,
+            statsCatalog: statsCatalog,
             statId: statId, onStatId: setStatId, statParams: statParams, onStatParams: setStatParams,
             statResult: statResult, statBusy: statBusy, onRunStat: handleStat, code: code,
             history: history, onRestoreHistory: restoreHistory, onExport: handleExport,
@@ -1786,8 +2148,188 @@
     // ======================================================================
     // 右栏：预览 / 统计 / 代码 / 记录 / 自检
     // ======================================================================
+
+    /** 导出绑定状态机 token → 人话（未知 token 原样显示，不编含义）。 */
+    function contractStatusLabel(status) {
+      var map = {
+        reused: 'contractStatusReused',
+        rerendered: 'contractStatusRerendered',
+        rendered: 'contractStatusRendered',
+        legacy: 'contractStatusLegacy',
+        absent: 'contractStatusAbsent',
+      }
+      var key = map[String(status || '')]
+      return key ? T(key) : T('contractNotRecorded')
+    }
+
+    /** 统计口径卡：数据集现状 + 最近 figure run 的检验/校正 + 导出绑定 + 引用前必须处理的项。 */
+    function StatsContractCard(props) {
+      var contract = props.contract || null
+      function kv(label, value) {
+        if (value === null || value === undefined || value === '') return null
+        return h('div', { className: 'pl-contract-row' },
+          h('span', { className: 'pl-contract-k' }, label),
+          h('span', { className: 'pl-contract-v' }, value))
+      }
+      function intText(value) {
+        return value === null || value === undefined ? '?' : String(value)
+      }
+      var badge = contract
+        ? h('span', { className: 'pl-badge ' + (contract.okToCite ? 'pl-badge-ok' : 'pl-badge-warn') },
+            contract.okToCite ? T('contractOk') : T('contractWarn'))
+        : null
+      var header = h('div', { className: 'pl-card-head' },
+        h('div', { className: 'pl-card-title' }, h(Icon, { name: 'stats', size: 12 }), T('contractTitle')),
+        badge)
+      if (!contract) {
+        return h('div', { className: 'pl-contract' }, header,
+          h('div', { className: 'pl-contract-hint' }, T('contractHint')),
+          h('div', { className: 'pl-empty' }, props.dataset ? T('contractLoading') : T('contractNoData')))
+      }
+      var dataset = contract.dataset || {}
+      var kinds = dataset.columnKinds || {}
+      var missing = dataset.missing || {}
+      var cleaning = dataset.cleaning || {}
+      var groups = dataset.groups || {}
+      var figure = contract.figure
+      var warns = (contract.caveats || []).filter(function (item) { return item.level === 'warn' })
+      var infos = (contract.caveats || []).filter(function (item) { return item.level !== 'warn' })
+      var dataText = [
+        dataset.name || dataset.id,
+        dataset.kind === 'matrix' ? '矩阵（特征×样本）' : (dataset.kind === 'tidy' ? '长表（一行一个观测）' : dataset.kind),
+        dataset.source ? (String(dataset.source).indexOf('demo:') === 0 ? T('contractSourceDemo') : dataset.source) : null,
+      ].filter(Boolean).join(' · ')
+      var shapeText = (dataset.nRows === null && dataset.nCols === null)
+        ? null : intText(dataset.nRows) + ' 行 × ' + intText(dataset.nCols) + ' 列'
+      var kindParts = []
+      if (kinds.numeric !== null) kindParts.push('数值 ' + kinds.numeric)
+      if (kinds.categorical !== null) kindParts.push('分类 ' + kinds.categorical)
+      if (kinds.time !== null) kindParts.push('时间 ' + kinds.time)
+      if (kinds.event !== null) kindParts.push('事件 ' + kinds.event)
+      if (kinds.other) kindParts.push('其它 ' + kinds.other)
+      var declared = dataset.declared || {}
+      if (declared.timeColumn) kindParts.push('时间列=' + declared.timeColumn + '（角色）')
+      if (declared.eventColumn) kindParts.push('事件列=' + declared.eventColumn + '（角色）')
+      var missingText = missing.missing === null ? null : (missing.missing === 0
+        ? T('contractMissingNone')
+        : intText(missing.missing) + ' 格' +
+          (missing.rate !== null ? '（' + (missing.rate * 100).toFixed(2) + '%）' : '') +
+          (missing.columnsWithMissing !== null ? ' · ' + missing.columnsWithMissing + ' 列' : ''))
+      var cleanText = cleaning.steps === null ? null : (cleaning.steps === 0
+        ? '未清洗'
+        : cleaning.steps + ' 步' +
+          (cleaning.ops.length ? '（' + cleaning.ops.join('→') + '）' : '') +
+          (cleaning.rowsImport !== null && cleaning.rowsCurrent !== null
+            ? '；' + cleaning.rowsImport + ' → ' + cleaning.rowsCurrent + ' 行' : ''))
+      var groupText = (groups.key || groups.levels.length)
+        ? [
+            groups.key || T('contractNoGroups'),
+            groups.levels.length
+              ? groups.levels.map(function (name) {
+                  var count = groups.counts[name]
+                  return name + ' ' + (count === null || count === undefined ? '?' : count)
+                }).join(' / ')
+              : '',
+          ].filter(Boolean).join(' · ')
+        : T('contractNoGroups')
+      var figureText = T('contractNoFigure')
+      var inferenceText = null
+      var rolesText = null
+      var styleText = null
+      if (figure) {
+        figureText = [
+          figure.chartTitle || figure.chart,
+          figure.figureRunId ? T('contractRunId') + '=' + figure.figureRunId : T('contractNotRecorded'),
+          figure.at ? formatTime(figure.at) : null,
+          figure.dataMatchesCurrent === false ? '数据指纹不一致' : null,
+          figure.artifactAvailable === false ? '图记录已清理' : null,
+        ].filter(Boolean).join(' · ')
+        if (figure.inference) {
+          var inf = figure.inference
+          var parts = [inf.method, inf.kind].filter(Boolean).join(' · ')
+          if (inf.pAdjust) parts += ' · ' + T('contractAdjust') + '=' + inf.pAdjust
+          parts += ' · ' + T('contractAlpha') + '=' + (inf.alpha === null ? T('contractNotRecorded') : inf.alpha)
+          if (inf.nContrasts !== null) parts += ' · 对比 ' + inf.nContrasts + ' 组'
+          var nKeys = Object.keys(inf.nPerGroup || {})
+          if (nKeys.length) {
+            parts += ' · n ' + nKeys.map(function (name) {
+              var count = inf.nPerGroup[name]
+              return name + ' ' + (count === null ? '?' : count)
+            }).join(' / ')
+          }
+          inferenceText = parts
+        } else {
+          inferenceText = T('contractNoInference')
+        }
+        var roleParts = []
+        ;['x', 'y', 'group', 'color', 'size', 'facet', 'time', 'event'].forEach(function (key) {
+          if (figure.roles && figure.roles[key]) roleParts.push(key + '=' + figure.roles[key])
+        })
+        rolesText = roleParts.length ? roleParts.join(' · ') : T('contractNotRecorded')
+        styleText = figure.styleOverrides.length
+          ? figure.styleOverrides.length + ' 项（' + figure.styleOverrides.slice(0, 5).join('、') + '）'
+          : T('contractStyleDefault')
+      }
+      var statText = T('contractNoStat')
+      if (contract.stat) {
+        statText = [
+          contract.stat.stat,
+          contract.stat.method,
+          contract.stat.pAdjust ? T('contractAdjust') + '=' + contract.stat.pAdjust : null,
+          contract.stat.alpha !== null ? T('contractAlpha') + '=' + contract.stat.alpha : null,
+          contract.stat.ok === false ? '失败' : null,
+          contract.stat.at ? formatTime(contract.stat.at) : null,
+        ].filter(Boolean).join(' · ')
+      }
+      var exportText = T('contractNoExport')
+      if (contract.exportInfo) {
+        var exp = contract.exportInfo
+        exportText = [
+          exp.what,
+          contractStatusLabel(exp.status),
+          exp.figureRunId ? T('contractRunId') + '=' + exp.figureRunId : T('contractNotRecorded'),
+          exp.dataMatchesCurrentFigure === true ? T('contractExportMatch')
+            : (exp.dataMatchesCurrentFigure === false ? T('contractExportMismatch') : null),
+          exp.at ? formatTime(exp.at) : null,
+        ].filter(Boolean).join(' · ')
+      }
+      return h('div', { className: 'pl-contract' },
+        header,
+        h('div', { className: 'pl-contract-hint' }, T('contractHint')),
+        kv(T('contractDataset'), dataText || null),
+        kv(T('contractRows'), shapeText),
+        kv(T('contractColumnKinds'), kindParts.length ? kindParts.join(' · ') : null),
+        kv(T('contractMissing'), missingText),
+        kv(T('contractCleaning'), cleanText),
+        kv(T('contractGroups'), groupText),
+        kv(T('contractFigure'), figureText),
+        kv(T('contractInference'), inferenceText),
+        kv(T('contractRoles'), rolesText),
+        kv(T('contractStyle'), styleText),
+        kv(T('contractStat'), statText),
+        kv(T('contractExport'), exportText),
+        warns.length
+          ? h('div', { className: 'pl-contract-warn' },
+              h('div', { className: 'pl-contract-warn-title' }, T('contractCaveats') + '（' + warns.length + '）'),
+              warns.map(function (item, index) {
+                return h('div', { key: index, className: 'pl-contract-v' }, '· ' + item.text)
+              }))
+          : null,
+        infos.length
+          ? h('div', { className: 'pl-contract-info' },
+              h('div', null, T('contractInfo') + '（' + infos.length + '）'),
+              infos.map(function (item, index) {
+                return h('div', { key: 'i' + index, className: 'pl-contract-info-item' }, '· ' + item.text)
+              }))
+          : null)
+    }
+
     function RightColumn(props) {
       var dataset = props.dataset
+      // 口径卡：优先用记录页返回的契约（含 data_digest/导出绑定），其次用数据集状态里透传的那份
+      var contract = (props.records && (props.records.stats_contract ||
+        (props.records.dataset && props.records.dataset.stats_contract))) ||
+        (dataset && dataset.stats_contract) || null
       var tabs = [
         { id: 'preview', label: '预览' },
         { id: 'stats', label: '统计' },
@@ -1867,6 +2409,7 @@
         props.tab === 'code' ? h(CodePanel, { code: props.code, onExport: props.onExport, onCopy: props.onCopy }) : null,
 
         props.tab === 'history' ? h('div', { className: 'pl-tabpane' },
+          h(StatsContractCard, { contract: contract, dataset: dataset }),
           (props.history || []).length ? h('div', { className: 'pl-history' }, props.history.slice().reverse().map(function (entry, index) {
             return h('button', {
               key: (entry.id || index) + '-' + index,
@@ -2026,9 +2569,6 @@
         h('span', null, '绘图'))
     }
 
-    var DICT_ZH = { nav: '绘图', title: 'PlotLab 绘图工作台' }
-    var DICT_EN = { nav: 'PlotLab', title: 'PlotLab workbench' }
-
     function apply(ctx) {
       var locale = ctx.locale
       if (locale && typeof locale.register === 'function') {
@@ -2044,6 +2584,7 @@
           if (typeof ctx.effect === 'function') ctx.effect(registerDictionaries, NS + ': locale')
           else registerDictionaries()
         } catch (error) { warn('failed to install locale effect', error) }
+        T = createTranslator(locale)
       }
 
       var slots = ctx.slots
@@ -2111,6 +2652,7 @@
           CenterColumn: CenterColumn,
           RightColumn: RightColumn,
           StatsPanel: StatsPanel,
+          StatsContractCard: StatsContractCard,
           CodePanel: CodePanel,
           AuditPanel: AuditPanel,
           SidebarIcon: SidebarIcon,
